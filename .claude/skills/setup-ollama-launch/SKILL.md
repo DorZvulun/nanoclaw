@@ -48,7 +48,9 @@ it, so the address bar shows the bare URL. Override the port with
 The browser uses the normal `local-web:local` user, membership, and role. It
 becomes the install owner, with global CLI scope so it can create persistent
 agents without an approval detour, only when the install has no owner yet;
-otherwise it gets admin scoped to the launched group.
+otherwise it gets admin scoped to the launched group. Sidebar create and delete
+run with host authority regardless of that role; the token holder is the machine
+user.
 The launcher creates the selected agent's opaque local-web conversation before
 the service starts, then queues the standard `/welcome` turn into that exact
 conversation. Later launches and browser reconnects do not repeat it. The

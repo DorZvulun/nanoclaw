@@ -177,7 +177,10 @@ The one launch-specific rule: the browser (`local-web:local`) becomes the instal
 owner only when no owner exists yet, mirroring the wizard's first-owner rule.
 On an install that already has an owner it gets admin scoped to the launched
 group instead, so launching Ollama beside an existing channel cannot mint a
-second install-wide owner.
+second install-wide owner. That role governs what the browser user may ask an
+agent to do through `ncl`. The sidebar's create and delete controls run with
+host authority regardless: the access token belongs to the machine user, who
+could run `ncl` directly.
 
 ## Switching away from Ollama
 

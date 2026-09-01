@@ -84,7 +84,10 @@ The browser user is the single machine-local identity `local-web:local`. Ask
 whether that identity should be an owner, admin, or member, then register and
 wire the initial agent through NanoClaw's shared first-agent flow. The adapter
 backfills one opaque local-web conversation per agent group and the browser can
-create and switch additional agents without changing this human identity.
+create and switch additional agents without changing this human identity. The
+role applies to what the browser user asks agents to do through `ncl`; the
+sidebar's create and delete controls act with host authority because the token
+belongs to the machine user.
 Replace the placeholders with the operator name, role, and agent ID from
 `ncl groups list`.
 
