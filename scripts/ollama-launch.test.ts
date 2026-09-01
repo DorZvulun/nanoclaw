@@ -84,6 +84,74 @@ describe('Ollama launch contract', () => {
     }
   });
 
+  it('bootstraps when an ancestor checkout makes better-sqlite3 resolvable', () => {
+    const ambientRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-launch-ambient-'));
+    const root = path.join(ambientRoot, 'nested', 'nanoclaw');
+    const home = path.join(ambientRoot, 'home');
+    const bin = path.join(ambientRoot, 'bin');
+    const launcher = path.join(root, '.claude/skills/setup-ollama-launch/scripts/launch.sh');
+    try {
+      fs.mkdirSync(path.dirname(launcher), { recursive: true });
+      fs.mkdirSync(home);
+      fs.mkdirSync(bin);
+      fs.mkdirSync(path.join(ambientRoot, 'node_modules', 'better-sqlite3'), { recursive: true });
+      fs.writeFileSync(path.join(ambientRoot, 'node_modules', 'better-sqlite3', 'index.js'), 'module.exports = {}\n');
+      fs.copyFileSync(path.join(process.cwd(), '.claude/skills/setup-ollama-launch/scripts/launch.sh'), launcher);
+      fs.writeFileSync(
+        path.join(root, 'setup.sh'),
+        '#!/bin/bash\nset -e\ntouch "$HOME/setup-ran"\nmkdir -p node_modules/.bin node_modules/better-sqlite3\ntouch node_modules/.bin/tsx node_modules/better-sqlite3/package.json\nchmod +x node_modules/.bin/tsx\n',
+      );
+      fs.writeFileSync(path.join(bin, 'pnpm'), '#!/bin/sh\ntouch "$HOME/pnpm-reached"\n');
+      fs.writeFileSync(path.join(bin, 'node'), `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} "$@"\n`);
+      fs.chmodSync(path.join(bin, 'pnpm'), 0o755);
+      fs.chmodSync(path.join(bin, 'node'), 0o755);
+
+      execFileSync(process.execPath, ['-e', "require('better-sqlite3')"], { cwd: root });
+      expect(fs.existsSync(path.join(root, 'node_modules', '.bin', 'tsx'))).toBe(false);
+
+      execFileSync('/bin/bash', [launcher], { env: { HOME: home, PATH: `${bin}:/usr/bin:/bin` } });
+
+      expect(fs.existsSync(path.join(home, 'setup-ran'))).toBe(true);
+      expect(fs.existsSync(path.join(home, 'pnpm-reached'))).toBe(true);
+    } finally {
+      fs.rmSync(ambientRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('bootstraps when local dependency markers exist but better-sqlite3 cannot load', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-launch-partial-'));
+    const home = path.join(root, 'home');
+    const bin = path.join(root, 'bin');
+    const launcher = path.join(root, '.claude/skills/setup-ollama-launch/scripts/launch.sh');
+    try {
+      fs.mkdirSync(path.dirname(launcher), { recursive: true });
+      fs.mkdirSync(home);
+      fs.mkdirSync(bin);
+      fs.mkdirSync(path.join(root, 'node_modules', '.bin'), { recursive: true });
+      fs.mkdirSync(path.join(root, 'node_modules', 'better-sqlite3'), { recursive: true });
+      fs.copyFileSync(path.join(process.cwd(), '.claude/skills/setup-ollama-launch/scripts/launch.sh'), launcher);
+      fs.writeFileSync(path.join(root, 'node_modules', '.bin', 'tsx'), '#!/bin/sh\nexit 0\n');
+      fs.writeFileSync(
+        path.join(root, 'node_modules', 'better-sqlite3', 'package.json'),
+        '{"name":"better-sqlite3","main":"index.js"}\n',
+      );
+      fs.writeFileSync(path.join(root, 'node_modules', 'better-sqlite3', 'index.js'), 'throw new Error("broken")\n');
+      fs.chmodSync(path.join(root, 'node_modules', '.bin', 'tsx'), 0o755);
+      fs.writeFileSync(path.join(root, 'setup.sh'), '#!/bin/bash\ntouch "$HOME/setup-ran"\n');
+      fs.writeFileSync(path.join(bin, 'pnpm'), '#!/bin/sh\ntouch "$HOME/pnpm-reached"\n');
+      fs.writeFileSync(path.join(bin, 'node'), `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} "$@"\n`);
+      fs.chmodSync(path.join(bin, 'pnpm'), 0o755);
+      fs.chmodSync(path.join(bin, 'node'), 0o755);
+
+      execFileSync('/bin/bash', [launcher], { env: { HOME: home, PATH: `${bin}:/usr/bin:/bin` } });
+
+      expect(fs.existsSync(path.join(home, 'setup-ran'))).toBe(true);
+      expect(fs.existsSync(path.join(home, 'pnpm-reached'))).toBe(true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('fetches registry payloads without evaluating shell commands', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-skill-git-'));
     const source = path.join(root, 'source');

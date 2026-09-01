@@ -5,7 +5,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 cd "$PROJECT_ROOT"
 
-if ! command -v pnpm >/dev/null 2>&1 || ! node -e "require('better-sqlite3')" >/dev/null 2>&1; then
+local_runtime_ready() {
+  command -v node >/dev/null 2>&1 || return 1
+  [ -x "$PROJECT_ROOT/node_modules/.bin/tsx" ] || return 1
+  PROJECT_ROOT="$PROJECT_ROOT" node -e '
+    const path = require("node:path");
+    const root = path.resolve(process.env.PROJECT_ROOT);
+    const localModules = path.join(root, "node_modules") + path.sep;
+    const resolved = path.resolve(require.resolve("better-sqlite3", { paths: [root] }));
+    if (!resolved.startsWith(localModules)) process.exit(1);
+    const Database = require(resolved);
+    const db = new Database(":memory:");
+    db.close();
+  ' >/dev/null 2>&1
+}
+
+if ! command -v pnpm >/dev/null 2>&1 || ! local_runtime_ready; then
   bash "$PROJECT_ROOT/setup.sh"
 fi
 
