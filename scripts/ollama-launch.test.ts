@@ -13,9 +13,11 @@ import { closeDb, initTestDb } from '../src/db/connection.js';
 import {
   createMessagingGroup,
   createMessagingGroupAgent,
+  getMessagingGroup,
   getMessagingGroupAgentByPair,
   getMessagingGroupAgents,
   getMessagingGroupByPlatform,
+  getMessagingGroupsByAgentGroup,
 } from '../src/db/messaging-groups.js';
 import { getInstallSlug } from '../src/install-slug.js';
 import { runMigrations } from '../src/db/migrations/index.js';
@@ -41,6 +43,18 @@ import {
 afterEach(async () => closeDb());
 
 describe('Ollama launch contract', () => {
+  it('wires the launched group before service startup can backfill it', () => {
+    const source = fs.readFileSync(
+      path.join(process.cwd(), '.claude/skills/setup-ollama-launch/scripts/launch.ts'),
+      'utf8',
+    );
+    const main = source.slice(source.indexOf('async function main'));
+    const wiringIndex = main.indexOf('const webWiring = await ensureWebWiring');
+    const serviceIndex = main.indexOf("runSetupStep('service')");
+    expect(wiringIndex).toBeGreaterThan(-1);
+    expect(serviceIndex).toBeGreaterThan(wiringIndex);
+  });
+
   it('keeps pnpm from recursively self-installing in a fresh home', () => {
     const setup = fs.readFileSync(path.join(process.cwd(), 'setup.sh'), 'utf8');
     const launcher = fs.readFileSync(
@@ -142,9 +156,14 @@ describe('Ollama launch contract', () => {
       created_at: new Date().toISOString(),
     });
 
-    expect(await ensureWebWiring('ag-web')).toBe(true);
-    expect(await ensureWebWiring('ag-web')).toBe(false);
+    const firstWiring = await ensureWebWiring('ag-web');
+    expect(firstWiring.newlyWired).toBe(true);
+    expect(await ensureWebWiring('ag-web')).toEqual({
+      conversationId: firstWiring.conversationId,
+      newlyWired: false,
+    });
     const group = await getMessagingGroupByPlatform('local-web', 'local-web:local');
+    expect(firstWiring.conversationId).toBe(group?.id);
     expect(group?.name).toBe('User');
     expect(group && (await getMessagingGroupAgentByPair(group.id, 'ag-web'))?.engage_pattern).toBe('.');
     expect(group && (await getDestinationByTarget('ag-web', 'channel', group.id))?.local_name).toBe('user');
@@ -157,10 +176,15 @@ describe('Ollama launch contract', () => {
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    await ensureWebWiring('ag-web-2');
-    expect(group && (await getMessagingGroupAgents(group.id)).map((entry) => entry.agent_group_id)).toEqual([
-      'ag-web-2',
-    ]);
+    const secondWiring = await ensureWebWiring('ag-web-2');
+    const secondGroup = await getMessagingGroup(secondWiring.conversationId);
+    expect(secondWiring).toMatchObject({ newlyWired: true });
+    expect(secondGroup?.platform_id).toBe('local-web:agent:ag-web-2');
+    expect(secondGroup?.name).toBe('User');
+    expect(group && (await getMessagingGroupAgents(group.id)).map((entry) => entry.agent_group_id)).toEqual(['ag-web']);
+    expect(await getMessagingGroupsByAgentGroup('ag-web')).toHaveLength(1);
+    expect(await getMessagingGroupsByAgentGroup('ag-web-2')).toHaveLength(1);
+    expect((await getDestinationByTarget('ag-web-2', 'channel', secondWiring.conversationId))?.local_name).toBe('user');
   });
 
   it('queues the standard welcome through the wired local web channel', async () => {
@@ -183,12 +207,15 @@ describe('Ollama launch contract', () => {
     if (!address || typeof address === 'string') throw new Error('failed to start welcome test server');
     const url = `http://127.0.0.1:${address.port}`;
     try {
-      await sendWiringWelcome(url, 'test-token');
+      await sendWiringWelcome(url, 'test-token', 'mg-web');
       expect(request).toEqual({
         method: 'POST',
         origin: url,
         token: 'test-token',
-        body: { text: 'System instruction: run /welcome to introduce yourself to the user on this new channel.' },
+        body: {
+          conversationId: 'mg-web',
+          text: 'System instruction: run /welcome to introduce yourself to the user on this new channel.',
+        },
       });
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));

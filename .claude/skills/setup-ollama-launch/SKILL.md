@@ -49,9 +49,12 @@ The browser uses the normal `local-web:local` user, membership, and role. It
 becomes the install owner, with global CLI scope so it can create persistent
 agents without an approval detour, only when the install has no owner yet;
 otherwise it gets admin scoped to the launched group.
-When setup creates the local-web wiring, it queues the standard `/welcome` turn
-once through the normal channel path; later launches and browser reconnects do
-not repeat it.
+The launcher creates the selected agent's opaque local-web conversation before
+the service starts, then queues the standard `/welcome` turn into that exact
+conversation. Later launches and browser reconnects do not repeat it. The
+browser can create and switch additional agents; each gets its own messaging
+group, wiring, session, transcript, activity, and question stream while keeping
+the same machine-local human identity.
 
 The Ollama CLI owns the browsing consent, sign-in, cloud-status check, and live
 Web Search/Web Fetch probes. The launcher accepts only the verified

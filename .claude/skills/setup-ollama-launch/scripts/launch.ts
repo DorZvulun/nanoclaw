@@ -21,6 +21,7 @@ import {
   getMessagingGroupAgentByPair,
   getMessagingGroupAgents,
   getMessagingGroupByPlatform,
+  getMessagingGroupsByAgentGroup,
 } from '../../../../src/db/messaging-groups.js';
 import { runMigrations } from '../../../../src/db/migrations/index.js';
 import { readEnvFile } from '../../../../src/env.js';
@@ -153,28 +154,43 @@ export function rewriteBaseUrlForContainer(baseUrl: string): string {
   return `${url.protocol}//host.docker.internal${suffix}`;
 }
 
+export interface WebWiringResult {
+  conversationId: string;
+  newlyWired: boolean;
+}
+
 /** Give the local browser its own conversation with the selected agent. */
-export async function ensureWebWiring(agentGroupId: string): Promise<boolean> {
+export async function ensureWebWiring(agentGroupId: string): Promise<WebWiringResult> {
   const now = new Date().toISOString();
   let newlyWired = false;
-  let messagingGroup = await getMessagingGroupByPlatform(WEB_CHANNEL, WEB_PLATFORM_ID);
+  const existingConversations = (await getMessagingGroupsByAgentGroup(agentGroupId))
+    .filter((group) => group.channel_type === WEB_CHANNEL && (group.instance ?? group.channel_type) === WEB_CHANNEL)
+    .sort(
+      (a, b) =>
+        Number(b.platform_id === WEB_PLATFORM_ID) - Number(a.platform_id === WEB_PLATFORM_ID) ||
+        a.id.localeCompare(b.id),
+    );
+  const dedicatedPlatformId = `local-web:agent:${agentGroupId}`;
+  const dedicatedGroup = await getMessagingGroupByPlatform(WEB_CHANNEL, dedicatedPlatformId, WEB_CHANNEL);
+  let messagingGroup = existingConversations[0] ?? dedicatedGroup;
+  const legacyGroup = await getMessagingGroupByPlatform(WEB_CHANNEL, WEB_PLATFORM_ID, WEB_CHANNEL);
+  if (!messagingGroup && (!legacyGroup || (await getMessagingGroupAgents(legacyGroup.id)).length === 0)) {
+    messagingGroup = legacyGroup;
+  }
   if (!messagingGroup) {
+    const platformId = legacyGroup ? dedicatedPlatformId : WEB_PLATFORM_ID;
+    const agentGroup = await getAgentGroup(agentGroupId);
+    if (!agentGroup) throw new LaunchError(1, `no agent group with id ${agentGroupId}`);
     messagingGroup = {
       id: `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       channel_type: WEB_CHANNEL,
-      platform_id: WEB_PLATFORM_ID,
+      platform_id: platformId,
       name: 'User',
       is_group: 0,
       unknown_sender_policy: 'public',
       created_at: now,
     };
     await createMessagingGroup(messagingGroup);
-  }
-  for (const wiring of await getMessagingGroupAgents(messagingGroup.id)) {
-    if (wiring.agent_group_id === agentGroupId) continue;
-    await deleteMessagingGroupAgent(wiring.id);
-    const destination = await getDestinationByTarget(wiring.agent_group_id, 'channel', messagingGroup.id);
-    if (destination) await deleteDestination(wiring.agent_group_id, destination.local_name);
   }
   if (!(await getMessagingGroupAgentByPair(messagingGroup.id, agentGroupId))) {
     await createMessagingGroupAgent({
@@ -202,7 +218,7 @@ export async function ensureWebWiring(agentGroupId: string): Promise<boolean> {
     const destination = await getDestinationByTarget(agentGroupId, 'channel', cliGroup.id);
     if (destination) await deleteDestination(agentGroupId, destination.local_name);
   }
-  return newlyWired;
+  return { conversationId: messagingGroup.id, newlyWired };
 }
 
 /**
@@ -461,13 +477,13 @@ export async function webChatIsReady(url: string): Promise<boolean> {
   }
 }
 
-export async function sendWiringWelcome(url: string, token: string): Promise<void> {
+export async function sendWiringWelcome(url: string, token: string, conversationId: string): Promise<void> {
   let response: Response;
   try {
     response = await fetch(`${url}/api/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', origin: url, [WEB_TOKEN_HEADER]: token },
-      body: JSON.stringify({ text: WELCOME_TEXT }),
+      body: JSON.stringify({ conversationId, text: WELCOME_TEXT }),
       redirect: 'error',
       signal: AbortSignal.timeout(10_000),
     });
@@ -600,6 +616,10 @@ async function main(): Promise<number> {
     previousWebBrowsing !== webBrowsing;
   await applyLaunchContainerConfig(agentGroup.id, model, ownsInstall);
   const runtimeModelChanged = writeOllamaModelState(model, runtimeModel, contextLength);
+  // Wire before service startup: the multi-agent adapter backfills every group
+  // without a local-web conversation as soon as the service starts.
+  const webWiring = await ensureWebWiring(agentGroup.id);
+  await db.close();
 
   // Rebuild only for a first install, newly-applied files, or a config change.
   // Warm before restart and queue the wiring welcome only after the web channel is ready.
@@ -612,11 +632,11 @@ async function main(): Promise<number> {
     await waitForCli();
     restartAgentGroup(agentGroup.id);
   }
-  const newlyWired = await ensureWebWiring(agentGroup.id);
-  await db.close();
   const token = localWebToken();
   if (!token) throw new LaunchError(1, `web chat answered at ${webUrl} but minted no access token; check logs/`);
-  if (newlyWired) await sendWiringWelcome(webUrl, token);
+  if (webWiring.newlyWired) {
+    await sendWiringWelcome(webUrl, token, webWiring.conversationId);
+  }
 
   // Fragment, so the page can store and strip it before the URL reaches browser
   // history. openUrl is best-effort and silent on failure, and isHeadless() is
