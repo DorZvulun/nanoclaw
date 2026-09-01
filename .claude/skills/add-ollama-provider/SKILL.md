@@ -78,11 +78,30 @@ ncl groups restart --id <agent-group-id>
 The provider sends a placeholder token directly to Ollama, blocks Anthropic and
 Claude service hosts, and disables Claude Code's cloud-only integrations and
 background traffic. Web browsing defaults to disabled. When
-`OLLAMA_WEB_BROWSING=enabled`, native `WebSearch` and an Ollama-backed
-`WebFetch` alias both use the local daemon's hosted Ollama endpoints; NanoClaw
-does not receive or store an Ollama API key. The local `agent-browser` remains
-available for interactive browser work. Nothing else needs editing: no group
+`OLLAMA_WEB_BROWSING=enabled`, two small MCP tools call the local daemon's signed
+Ollama Web Search and Web Fetch endpoints directly. This avoids the slower
+model-orchestrated server-tool path: Anthropic's built-in server tools stay
+disabled. NanoClaw does not receive or store an Ollama API key. The local
+`agent-browser` remains available for interactive browser work. Nothing else
+needs editing: no group
 `container.json`, Claude settings file, proxy, or API key.
+
+When browsing is enabled, the Ollama provider names the two direct MCP tools in
+its system instructions: search for finding URLs, fetch for reading a supplied
+URL or selected result. It reserves `agent-browser` for clicks, forms, sign-in
+state, screenshots, and visual inspection. This keeps local models on the fast
+daemon path without lowering their reasoning effort.
+
+The same provider instructions make `approval-pending` a hard wait point: the
+agent acknowledges the pending request, ends that turn, and resumes only when
+the host delivers the real approval result.
+
+Persistent-agent creation and messaging use NanoClaw's normal provider-neutral
+flow. Ollama does not force the turn to end after either action, so a parent can
+create and brief an agent in one turn and a receiving child can complete the
+work normally. The provider also states the runtime boundary explicitly: an
+acknowledgment does not start a background job, so a receiving agent must do the
+work before ending its turn.
 
 Behavior details, including the `WebFetch` preflight skip and the
 runaway-generation caps: `docs/ollama.md`.

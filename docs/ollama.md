@@ -38,11 +38,18 @@ Web Fetch before handing the result to NanoClaw. NanoClaw saves
 `OLLAMA_WEB_BROWSING=enabled` only after it accepts the launch handoff. Re-run
 `ollama launch nanoclaw --config` to change the choice.
 
-When enabled, both tools are Ollama-owned:
+When enabled, both tools are Ollama-owned MCP adapters for the daemon's signed
+endpoints:
 
-- `WebSearch` uses the Ollama daemon's native Anthropic-compatible search tool.
-- `WebFetch` is aliased to NanoClaw's small adapter for the daemon's
-  `/api/experimental/web_fetch` endpoint.
+- `WebSearch` calls `/api/experimental/web_search` directly and returns bounded
+  results to the model.
+- `WebFetch` calls `/api/experimental/web_fetch` for the selected result.
+
+The direct search adapter avoids asking the model-facing Anthropic-compatible
+endpoint to orchestrate its own server tool, which can hold a local turn open
+for minutes even though the daemon's search endpoint responds quickly. The
+provider removes and disallows the built-in server tools, so a
+`server_tool_use` event cannot bypass the direct adapters.
 
 The agent container sends both requests only to `host.docker.internal`; the
 daemon signs the hosted request with the account created by `ollama signin`.
@@ -53,6 +60,15 @@ such as Google, Slack, or GitHub, because only the local Ollama hostname is in
 
 When browsing is disabled, both model-facing web tools are removed. The local
 `agent-browser` remains available for interactive browser automation.
+
+When browsing is enabled, the provider's system instructions name the direct
+MCP search and fetch tools and reserve `agent-browser` for interactive or
+visual work. This avoids a local model spending a full generation deciding how
+to retrieve a page; it does not change the model's reasoning effort.
+
+An `ncl` result marked `approval-pending` is also a hard wait point in the
+provider instructions. The agent acknowledges it, ends the turn, and resumes
+only after the host sends the actual approval outcome.
 
 Two container environment settings bound a runaway local generation.
 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` (8192) ends it by output length instead of
@@ -99,6 +115,14 @@ and use NanoClaw's normal asynchronous messaging behavior. Launch-created model
 state pins Claude Code's main, alias, background, and subagent routing to the
 same Ollama runtime model. Provider routing and blocked hosts are derived again
 at every container spawn, so children do not fall back to another provider.
+Creating a child does not end the parent's turn: the host first confirms that
+the new destination is ready, then the parent can assign work. Ollama adds no
+provider-specific stop rule after creation or agent messaging; the same model
+turn may continue. The parent receives the child's later reports through normal
+NanoClaw messages.
+Ollama's system instructions also spell out that an acknowledgment alone does
+not schedule background execution: a receiving child must make progress in the
+current turn before it reports or ends.
 
 Ollama cloud models manage their context in the Ollama service, so launch does
 not create a local context alias for them.
@@ -116,8 +140,9 @@ does not add model-specific prompt workarounds for those failures.
 1. It sends an empty native generate request with `keep_alive: -1` to load the
    model weights.
 2. When setup creates the local-web wiring, it sends `/welcome` through the
-   complete NanoClaw agent prompt before opening the browser. Later launches
-   and browser reconnects do not repeat it.
+   complete NanoClaw agent prompt in that agent's exact browser conversation
+   before opening the browser. Later launches and browser reconnects do not
+   repeat it.
 
 These are not two copies of the same warm-up: the first removes model-load
 latency, while the second builds the real agent-prefix cache. The provider also
@@ -142,6 +167,12 @@ with its access token in the URL fragment, and prints the bare
 `http://127.0.0.1:3210` (set `NANOCLAW_LOCAL_WEB_PORT` for another port). The
 channel and its security model are documented in the `/add-local-web-chat` skill.
 
+The browser lists one opaque conversation per agent. Creating an agent in the
+UI inherits the selected agent's provider and model unless the operator chooses
+an installed override, and creates no model turn until the user sends its first
+message. Replies, activity, questions, and approvals stay scoped to the selected
+conversation.
+
 The one launch-specific rule: the browser (`local-web:local`) becomes the install
 owner only when no owner exists yet, mirroring the wizard's first-owner rule.
 On an install that already has an owner it gets admin scoped to the launched
@@ -164,11 +195,11 @@ provider code from the installation entirely.
 
 - **No response:** confirm `curl -sf http://localhost:11434/api/tags` succeeds.
 - **Model not found:** copy the exact name shown by `ollama list`.
-- **Container tries a cloud provider:** confirm `ncl groups config get --id
-  <agent-group-id>` reports `provider: ollama`, then restart the group.
+- **Container tries a cloud provider:** run `ncl groups config get --id <agent-group-id>`, confirm it reports
+  `provider: ollama`, then restart the group.
 - **Chat says it has no access token:** the tab predates the token, or its
-  storage was cleared. Re-run `ollama launch nanoclaw`, or open the URL printed
-  by `/add-local-web-chat`.
+  storage was cleared. Re-run `ollama launch nanoclaw`, or run `pnpm local-web`
+  in the NanoClaw folder from the host terminal and open the URL it prints.
 - **Launched before the scoped-grant change:** an existing global-owner grant is
   never downgraded, so an install that ran the old launcher still has
   `local-web:local` as a global owner. Check `ncl roles list` and revoke it if
