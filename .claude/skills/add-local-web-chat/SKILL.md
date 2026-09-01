@@ -11,19 +11,31 @@ keeps its existing provider and model.
 
 ## Apply
 
-### 1. Copy the adapter, page, and tests
+### 1. Copy the adapter, conversation modules, page assets, helpers, and tests
 
-Fetch the `channels` branch and copy the local web adapter, page, registration
-test, and behavior tests. The registry branch is the canonical source, so
-re-applying the skill overwrites these files.
+Fetch the `channels` branch and copy the complete local web payload. The
+registry branch is the canonical source, so re-applying the skill overwrites
+these files.
 
 ```nc:copy from-branch:channels
+scripts/local-web-preview.ts
+scripts/local-web-url.ts
 src/channels/local-web.ts
+src/channels/local-web-conversations.ts
 src/channels/local-web-page.html
 src/channels/local-web-page.css
+src/channels/local-web-chat.css
+src/channels/local-web-conversations.css
 src/channels/local-web-page.js
+src/channels/local-web-conversation-ui.js
+src/channels/local-web-conversation-ui.test.ts
 src/channels/local-web-registration.test.ts
 src/channels/local-web.test.ts
+src/channels/local-web-conversations.test.ts
+src/channels/local-web-default-provider.test.ts
+src/channels/local-web-isolation.test.ts
+src/channels/local-web-page.test.ts
+src/channels/local-web-provider-inheritance.test.ts
 ```
 
 ### 2. Register the adapter
@@ -32,7 +44,16 @@ src/channels/local-web.test.ts
 import './local-web.js';
 ```
 
-### 3. Install Markdown rendering
+### 3. Add the authenticated URL command
+
+Expose the channel-owned URL helper through the project package scripts. It is
+safe to re-run and keeps token handling out of the adapter logs.
+
+```nc:run
+pnpm pkg set 'scripts.local-web=tsx scripts/local-web-url.ts'
+```
+
+### 4. Install Markdown rendering
 
 Pinned to an exact version; the adapter's unmocked behavior test imports it.
 
@@ -40,17 +61,18 @@ Pinned to an exact version; the adapter's unmocked behavior test imports it.
 markdown-it@15.0.0
 ```
 
-### 4. Build and validate
+### 5. Build and validate
 
 ```nc:run effect:build
 pnpm run build
 ```
 
 ```nc:run effect:test
-pnpm exec vitest run src/channels/local-web-registration.test.ts src/channels/local-web.test.ts
+pnpm exec eslint src/channels/local-web-page.js src/channels/local-web-conversation-ui.js
+pnpm exec vitest run src/channels/local-web-registration.test.ts src/channels/local-web.test.ts src/channels/local-web-conversation-ui.test.ts src/channels/local-web-conversations.test.ts src/channels/local-web-default-provider.test.ts src/channels/local-web-isolation.test.ts src/channels/local-web-page.test.ts src/channels/local-web-provider-inheritance.test.ts
 ```
 
-### 5. Restart NanoClaw
+### 6. Restart NanoClaw
 
 ```nc:run effect:restart
 pnpm exec tsx setup/index.ts --step service
@@ -58,10 +80,13 @@ pnpm exec tsx setup/index.ts --step service
 
 ## Wire an agent
 
-The browser is the single machine-local identity `local-web:local`. Ask whether
-that identity should be an owner, admin, or member, then register and wire it
-through NanoClaw's shared first-agent flow. Replace the placeholders with the
-operator name, role, and agent ID from `ncl groups list`.
+The browser user is the single machine-local identity `local-web:local`. Ask
+whether that identity should be an owner, admin, or member, then register and
+wire the initial agent through NanoClaw's shared first-agent flow. The adapter
+backfills one opaque local-web conversation per agent group and the browser can
+create and switch additional agents without changing this human identity.
+Replace the placeholders with the operator name, role, and agent ID from
+`ncl groups list`.
 
 ```bash
 pnpm exec tsx scripts/init-first-agent.ts \
@@ -75,6 +100,9 @@ pnpm exec tsx scripts/init-first-agent.ts \
 
 Only after the shared wiring command succeeds, open the chat. Open the URL, do
 not print it: the token is a secret and this runs inside an agent transcript.
+If the operator wants to open it themselves, tell them to run `pnpm local-web`
+in the NanoClaw folder in their own terminal; that command prints the
+authenticated URL for them, not for the agent transcript.
 
 ```bash
 PORT=$(grep -E '^NANOCLAW_LOCAL_WEB_PORT=' .env | cut -d= -f2)

@@ -8,6 +8,7 @@ rm -f \
   src/providers/ollama.test.ts \
   src/providers/ollama-registration.test.ts \
   container/agent-runner/src/providers/ollama.ts \
+  container/agent-runner/src/providers/ollama.test.ts \
   container/agent-runner/src/providers/ollama-registration.test.ts \
   container/agent-runner/src/providers/ollama-tool-policy.test.ts \
   container/agent-runner/src/mcp-tools/ollama-web.ts \
