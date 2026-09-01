@@ -2,6 +2,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -22,6 +23,7 @@ import {
   getMessagingGroupAgents,
   getMessagingGroupByPlatform,
   getMessagingGroupsByAgentGroup,
+  getMessagingGroupsByChannel,
 } from '../../../../src/db/messaging-groups.js';
 import { runMigrations } from '../../../../src/db/migrations/index.js';
 import { readEnvFile } from '../../../../src/env.js';
@@ -50,6 +52,8 @@ const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '0.0.0.0', '[::1]']);
 const DEFAULT_WEB_PORT = 3210;
 const WEB_CHANNEL = 'local-web';
 const WEB_PLATFORM_ID = 'local-web:local';
+/** Mirrors the Ollama CLI's first-run --agent-name, so a recreated agent keeps the same name. */
+const LAUNCH_AGENT_NAME = 'Ollama';
 const WEB_USER_ID = WEB_PLATFORM_ID;
 const WEB_TOKEN_HEADER = 'x-nanoclaw-local-web-token';
 const WELCOME_TEXT = 'System instruction: run /welcome to introduce yourself to the user on this new channel.';
@@ -395,7 +399,21 @@ async function waitForCli(): Promise<void> {
   throw new LaunchError(1, 'NanoClaw started, but its ncl socket is not ready; check logs/nanoclaw.error.log');
 }
 
-async function resolveAgentGroup(args: Pick<LaunchArgs, 'group' | 'displayName'>): Promise<AgentGroup> {
+/** The Ollama CLI passes no display name once onboarded; mirror its first-run default. */
+export function launchFallbackDisplayName(): string {
+  const name = os.userInfo().username.trim();
+  return name || 'operator';
+}
+
+/**
+ * Resolve the agent to launch. Explicit flags must match; the automatic path
+ * takes whichever agent still owns a browser conversation (the shared one
+ * first) and finally the CLI bootstrap wiring. Undefined means the launched
+ * agent was deleted after onboarding and a first agent must be created again.
+ */
+export async function resolveAgentGroup(
+  args: Pick<LaunchArgs, 'group' | 'displayName'>,
+): Promise<AgentGroup | undefined> {
   if (args.group) {
     const group = await getAgentGroup(args.group);
     if (!group) throw new LaunchError(1, `no agent group with id ${args.group}`);
@@ -407,14 +425,21 @@ async function resolveAgentGroup(args: Pick<LaunchArgs, 'group' | 'displayName'>
     if (!group) throw new LaunchError(1, `agent group was not created for ${args.displayName}`);
     return group;
   }
-  const webGroup = await getMessagingGroupByPlatform(WEB_CHANNEL, WEB_PLATFORM_ID);
+  const webGroups = (await getMessagingGroupsByChannel(WEB_CHANNEL))
+    .filter((group) => (group.instance ?? group.channel_type) === WEB_CHANNEL)
+    .sort(
+      (a, b) =>
+        Number(b.platform_id === WEB_PLATFORM_ID) - Number(a.platform_id === WEB_PLATFORM_ID) ||
+        a.id.localeCompare(b.id),
+    );
   const cliGroup = await getMessagingGroupByPlatform('cli', 'local');
-  const messagingGroup = webGroup ?? cliGroup;
-  // getMessagingGroupAgents orders by priority DESC already; the first row is the primary wiring.
-  const wiring = messagingGroup && (await getMessagingGroupAgents(messagingGroup.id))[0];
-  const group = wiring && (await getAgentGroup(wiring.agent_group_id));
-  if (!group) throw new LaunchError(1, 'no local agent found; retry with --display-name');
-  return group;
+  for (const messagingGroup of [...webGroups, ...(cliGroup ? [cliGroup] : [])]) {
+    // getMessagingGroupAgents orders by priority DESC already; the first row is the primary wiring.
+    const wiring = (await getMessagingGroupAgents(messagingGroup.id))[0];
+    const group = wiring && (await getAgentGroup(wiring.agent_group_id));
+    if (group) return group;
+  }
+  return undefined;
 }
 
 function configuredWebPort(): number {
@@ -605,7 +630,19 @@ async function main(): Promise<number> {
 
   const db = await initDb(path.join(DATA_DIR, 'v2.db'));
   await runMigrations(db);
-  const agentGroup = await resolveAgentGroup({ group, displayName });
+  let agentGroup = await resolveAgentGroup({ group, displayName });
+  if (!agentGroup) {
+    // Every agent was deleted from the browser after onboarding. The Ollama CLI
+    // no longer passes --display-name, so recreate the first agent as the first
+    // run did instead of dead-ending on a flag the user cannot supply.
+    const fallbackName = launchFallbackDisplayName();
+    runSetupStep('cli-agent', ['--display-name', fallbackName, '--agent-name', agentName ?? LAUNCH_AGENT_NAME], {
+      ...process.env,
+      NANOCLAW_PICKED_PROVIDER: 'ollama',
+    });
+    agentGroup = await resolveAgentGroup({ displayName: fallbackName });
+    if (!agentGroup) throw new LaunchError(1, `agent group was not created for ${fallbackName}`);
+  }
   const previousConfig = await getContainerConfig(agentGroup.id);
   const ownsInstall = await ensureLocalWebOperator(agentGroup.id, displayName);
   const configChanged =

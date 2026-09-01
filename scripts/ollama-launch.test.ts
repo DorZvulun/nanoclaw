@@ -13,6 +13,7 @@ import { closeDb, initTestDb } from '../src/db/connection.js';
 import {
   createMessagingGroup,
   createMessagingGroupAgent,
+  deleteMessagingGroupAgent,
   getMessagingGroup,
   getMessagingGroupAgentByPair,
   getMessagingGroupAgents,
@@ -30,7 +31,9 @@ import {
   ensureLocalWebOperator,
   ensureWebWiring,
   hasReusableOnecli,
+  launchFallbackDisplayName,
   parseArgs,
+  resolveAgentGroup,
   providerPayloadNeedsContainerBuild,
   rewriteBaseUrlForContainer,
   runSkillGitCommand,
@@ -253,6 +256,30 @@ describe('Ollama launch contract', () => {
     expect(await getMessagingGroupsByAgentGroup('ag-web')).toHaveLength(1);
     expect(await getMessagingGroupsByAgentGroup('ag-web-2')).toHaveLength(1);
     expect((await getDestinationByTarget('ag-web-2', 'channel', secondWiring.conversationId))?.local_name).toBe('user');
+  });
+
+  it('relaunch finds any surviving browser agent and reports none after the last deletion', async () => {
+    const db = await initTestDb();
+    await runMigrations(db);
+    for (const [id, name] of [
+      ['ag-web', 'Web Agent'],
+      ['ag-child', 'Child'],
+    ] as const) {
+      await createAgentGroup({ id, name, folder: id, agent_provider: null, created_at: new Date().toISOString() });
+    }
+    const launched = await ensureWebWiring('ag-web');
+    const child = await ensureWebWiring('ag-child');
+    expect((await resolveAgentGroup({}))?.id).toBe('ag-web');
+
+    // `groups delete` removes wirings and leaves the conversation rows behind.
+    const launchedWiring = await getMessagingGroupAgentByPair(launched.conversationId, 'ag-web');
+    await deleteMessagingGroupAgent(launchedWiring!.id);
+    expect((await resolveAgentGroup({}))?.id).toBe('ag-child');
+
+    const childWiring = await getMessagingGroupAgentByPair(child.conversationId, 'ag-child');
+    await deleteMessagingGroupAgent(childWiring!.id);
+    expect(await resolveAgentGroup({})).toBeUndefined();
+    expect(launchFallbackDisplayName().length).toBeGreaterThan(0);
   });
 
   it('queues the standard welcome through the wired local web channel', async () => {
