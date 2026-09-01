@@ -15,6 +15,7 @@ import type { ChannelAdapter, ChannelDefaults, ChannelSetup, OutboundMessage } f
 import { registerChannelAdapter } from './channel-registry.js';
 import {
   createLocalWebAgent,
+  deleteLocalWebAgent,
   ensureLocalWebConversations,
   isKnownLocalWebPlatformId,
   listLocalWebCatalog,
@@ -22,6 +23,7 @@ import {
   LOCAL_WEB_LEGACY_PLATFORM_ID,
   LOCAL_WEB_USER_ID,
   localWebPlatformIdForConversation,
+  localWebPlatformIdForQuestion,
   localWebQuestionBelongsToConversation,
   parseCreateLocalWebAgentRequest,
 } from './local-web-conversations.js';
@@ -46,10 +48,11 @@ type ParseFailure = { ok: false; status: number; message: string };
 type ParsedObject = { ok: true; value: Record<string, unknown> } | ParseFailure;
 type ParsedMessage = { ok: true; conversationId: string; text: string } | ParseFailure;
 type ParsedAction = { ok: true; conversationId: string; questionId: string; option: number } | ParseFailure;
+type ParsedConversationRequest = { ok: true; conversationId: string } | ParseFailure;
 
 type WebEvent =
   | { type: 'reply'; text: string; html: string }
-  | { type: 'question-resolution'; questionId: string; resolution: string }
+  | { type: 'question-resolution'; questionId: string; resolution: string; continuesTurn?: boolean }
   | {
       type: 'question';
       questionId: string;
@@ -162,6 +165,18 @@ async function parseMessage(req: IncomingMessage): Promise<ParsedMessage> {
     return { ok: false, status: 413, message: `Messages are limited to ${MAX_MESSAGE_CHARS} characters.` };
   }
   return { ok: true, conversationId, text: text.trim() };
+}
+
+async function parseConversationRequest(req: IncomingMessage): Promise<ParsedConversationRequest> {
+  const parsed = await parseObject(req);
+  if (!parsed.ok) return parsed;
+  const unexpected = Object.keys(parsed.value).find((field) => field !== 'conversationId');
+  if (unexpected) return { ok: false, status: 400, message: `Unknown field: ${unexpected}.` };
+  const conversationId = parsed.value.conversationId;
+  if (typeof conversationId !== 'string' || conversationId.length === 0 || conversationId.length > 128) {
+    return { ok: false, status: 400, message: 'A valid conversation ID is required.' };
+  }
+  return { ok: true, conversationId };
 }
 
 async function parseAction(req: IncomingMessage): Promise<ParsedAction> {
@@ -289,6 +304,7 @@ function createAdapter(): ChannelAdapter {
   // Server-side buffer while no browser is connected; unrelated to the page's own 100-item view cap.
   const MAX_PENDING_EVENTS = 100;
   const pendingEvents = new Map<string, WebEvent[]>();
+  const questionTargets = new Map<string, string>();
   let server: http.Server | null = null;
   const awaitingReplies = new Set<string>();
 
@@ -342,6 +358,7 @@ function createAdapter(): ChannelAdapter {
         sendJson(res, 403, { error: 'Cross-origin requests are not allowed.' });
         return;
       }
+      await ensureLocalWebConversations();
       sendJson(res, 200, await listLocalWebCatalog());
       return;
     }
@@ -430,6 +447,34 @@ function createAdapter(): ChannelAdapter {
       sendJson(res, result.created ? 201 : 200, result);
       return;
     }
+    if (req.method === 'DELETE' && pathname === '/api/agents') {
+      if (!requestOriginAllowed(req, authority) || req.headers.origin !== authority) {
+        sendJson(res, 403, { error: 'Cross-origin requests are not allowed.' });
+        return;
+      }
+      const request = await parseConversationRequest(req);
+      if (!request.ok) {
+        sendJson(res, request.status, { error: request.message });
+        return;
+      }
+      const platformId = await localWebPlatformIdForConversation(request.conversationId);
+      if (!platformId) {
+        sendJson(res, 404, { error: 'The selected agent is no longer available.' });
+        return;
+      }
+      const result = await deleteLocalWebAgent(request.conversationId);
+      if (!result.ok) {
+        if (result.detail) log.warn('Local web agent deletion failed', { detail: result.detail });
+        sendJson(res, result.status, { error: result.message });
+        return;
+      }
+      for (const client of clients.get(platformId) ?? []) client.end();
+      clients.delete(platformId);
+      pendingEvents.delete(platformId);
+      awaitingReplies.delete(platformId);
+      sendJson(res, 200, result);
+      return;
+    }
     if (req.method === 'POST' && pathname === '/api/actions') {
       if (!requestOriginAllowed(req, authority) || req.headers.origin !== authority) {
         sendJson(res, 403, { error: 'Cross-origin requests are not allowed.' });
@@ -460,10 +505,12 @@ function createAdapter(): ChannelAdapter {
       }
       const selected = render.options[parsed.option]!;
       setup.onAction(parsed.questionId, selected.value, LOCAL_WEB_USER_ID);
+      awaitingReplies.add(platformId);
       publish(platformId, {
         type: 'question-resolution',
         questionId: parsed.questionId,
         resolution: selected.selectedLabel,
+        continuesTurn: true,
       });
       sendJson(res, 202, { ok: true });
       return;
@@ -499,6 +546,7 @@ function createAdapter(): ChannelAdapter {
       }
       clients.clear();
       pendingEvents.clear();
+      questionTargets.clear();
       awaitingReplies.clear();
       if (!server) return;
       const active = server;
@@ -519,15 +567,26 @@ function createAdapter(): ChannelAdapter {
     },
 
     async deliver(platformId, _threadId, message): Promise<string | undefined> {
-      if (!(await isKnownLocalWebPlatformId(platformId))) return undefined;
       const event = await toWebEvent(message);
       if (event === null) return undefined;
+      let targetPlatformId = platformId;
+      if (event.type === 'question') {
+        targetPlatformId = (await localWebPlatformIdForQuestion(event.questionId)) ?? platformId;
+        questionTargets.set(event.questionId, targetPlatformId);
+      } else if (event.type === 'question-resolution') {
+        targetPlatformId =
+          questionTargets.get(event.questionId) ??
+          (await localWebPlatformIdForQuestion(event.questionId)) ??
+          platformId;
+        questionTargets.delete(event.questionId);
+      }
+      if (!(await isKnownLocalWebPlatformId(targetPlatformId))) return undefined;
       const completesTurn = event.type === 'reply' || event.type === 'question';
-      if (completesTurn) awaitingReplies.delete(platformId);
-      if ((clients.get(platformId)?.size ?? 0) === 0) {
-        queue(platformId, event);
+      if (completesTurn) awaitingReplies.delete(targetPlatformId);
+      if ((clients.get(targetPlatformId)?.size ?? 0) === 0) {
+        queue(targetPlatformId, event);
       } else {
-        publish(platformId, event);
+        publish(targetPlatformId, event);
       }
       return event.type === 'question' ? event.questionId : undefined;
     },

@@ -1,10 +1,11 @@
 /** Browser-side conversation state and API client for the local-web page. */
 
-/* global sessionStorage */
+/* global document, sessionStorage */
 
 const selectedKey = 'nanoclaw-local-web-selected-conversation';
 const transcriptPrefix = 'nanoclaw-local-web-history:';
 const maxVisibleItems = 100;
+const catalogRefreshMillis = 1_000;
 
 function readSession(key) {
   try {
@@ -40,7 +41,6 @@ function parseCatalog(value) {
   const installedProviders = Array.isArray(value.installedProviders)
     ? value.installedProviders.filter((provider) => typeof provider === 'string')
     : [];
-  if (conversations.length === 0) throw new Error('No local agents are available.');
   return {
     conversations,
     installedProviders,
@@ -61,6 +61,8 @@ export function createConversationController({ token, tokenHeader, onCatalog, on
   let catalog = null;
   let selected = null;
   let streamAbort = null;
+  let catalogRefreshTimer = null;
+  let isCatalogRefreshRunning = false;
 
   function headers(extra = {}) {
     return { ...extra, [tokenHeader]: token };
@@ -144,6 +146,50 @@ export function createConversationController({ token, tokenHeader, onCatalog, on
     void stream(conversationId, streamAbort.signal);
   }
 
+  function clearSelection() {
+    streamAbort?.abort();
+    streamAbort = null;
+    selected = null;
+    writeSession(selectedKey, '');
+    onSelected(null, []);
+  }
+
+  async function reconcileSelection(loaded) {
+    if (selected) {
+      const current = loaded.conversations.find(
+        (conversation) => conversation.conversationId === selected.conversationId,
+      );
+      if (current) {
+        selected = current;
+        return;
+      }
+    }
+    const fallback = loaded.conversations.find((conversation) => conversation.isLegacy) ?? loaded.conversations[0];
+    if (fallback) await select(fallback.conversationId);
+    else clearSelection();
+  }
+
+  async function refreshCatalog() {
+    if (isCatalogRefreshRunning) return;
+    isCatalogRefreshRunning = true;
+    try {
+      const loaded = await loadCatalog();
+      await reconcileSelection(loaded);
+    } finally {
+      isCatalogRefreshRunning = false;
+    }
+  }
+
+  function startCatalogRefresh() {
+    catalogRefreshTimer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      void refreshCatalog().catch(() => {
+        // The event stream owns connection state; a transient catalog failure
+        // must not interrupt the selected conversation.
+      });
+    }, catalogRefreshMillis);
+  }
+
   async function initialize() {
     const loaded = await loadCatalog();
     const stored = readSession(selectedKey);
@@ -151,7 +197,9 @@ export function createConversationController({ token, tokenHeader, onCatalog, on
       loaded.conversations.find((conversation) => conversation.conversationId === stored) ??
       loaded.conversations.find((conversation) => conversation.isLegacy) ??
       loaded.conversations[0];
-    await select(initial.conversationId);
+    if (initial) await select(initial.conversationId);
+    else clearSelection();
+    startCatalogRefresh();
   }
 
   async function createAgent(input) {
@@ -172,7 +220,19 @@ export function createConversationController({ token, tokenHeader, onCatalog, on
     return result;
   }
 
+  async function deleteAgent(conversationId) {
+    const response = await fetch('/api/agents', {
+      method: 'DELETE',
+      headers: headers({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ conversationId }),
+    });
+    const result = await responseJson(response);
+    await reconcileSelection(await loadCatalog());
+    return result;
+  }
+
   function dispose() {
+    if (catalogRefreshTimer !== null) clearInterval(catalogRefreshTimer);
     streamAbort?.abort();
   }
 
@@ -180,6 +240,7 @@ export function createConversationController({ token, tokenHeader, onCatalog, on
     initialize,
     select,
     createAgent,
+    deleteAgent,
     saveTranscript,
     dispose,
     get catalog() {

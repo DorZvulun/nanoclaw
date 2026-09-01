@@ -50,16 +50,25 @@ import { createConversationController } from './local-web-conversation-ui.js';
   const agentName = document.querySelector('#agent-name');
   const inheritAgent = document.querySelector('#inherit-agent');
   const inheritRuntime = document.querySelector('#inherit-runtime');
+  const inheritanceSummary = document.querySelector('.inheritance-summary');
   const providerField = document.querySelector('#provider-field');
   const providerSelect = document.querySelector('#agent-provider');
   const singleProvider = document.querySelector('#single-provider');
   const modelInput = document.querySelector('#agent-model');
   const effortSelect = document.querySelector('#agent-effort');
   const advancedOptions = document.querySelector('#advanced-options');
+  const deleteDialog = document.querySelector('#delete-agent-dialog');
+  const deleteForm = document.querySelector('#delete-agent-form');
+  const closeDeleteAgent = document.querySelector('#close-delete-agent');
+  const cancelDeleteAgent = document.querySelector('#cancel-delete-agent');
+  const submitDeleteAgent = document.querySelector('#submit-delete-agent');
+  const deleteError = document.querySelector('#delete-agent-error');
+  const deleteAgentName = document.querySelector('#delete-agent-name');
   const mobileSidebar = window.matchMedia('(max-width: 780px)');
   let activityTimer = null;
   let conversationController = null;
   let providerWasChanged = false;
+  let pendingDeleteConversation = null;
 
   // ---- theme ------------------------------------------------------------
   // No stored choice means follow the OS; the button writes an explicit one.
@@ -276,7 +285,8 @@ import { createConversationController } from './local-web-conversation-ui.js';
             throw new Error(responseBody.error || `Action failed (${response.status})`);
           }
           resolveQuestion(card.questionId, option.selectedLabel || option.label);
-          setState('Ready', 'ready');
+          setState('Working', 'busy');
+          setActivity('Thinking…');
         } catch (error) {
           resolution.textContent = error instanceof Error ? error.message : 'Action could not be sent.';
           resolution.hidden = false;
@@ -405,7 +415,8 @@ import { createConversationController } from './local-web-conversation-ui.js';
   function handleEvent(data) {
     try {
       if (data.type === 'ready') {
-        setState('Ready', 'ready');
+        const hasPendingQuestion = transcript.some((item) => item.type === 'question' && !item.resolution);
+        setState(hasPendingQuestion ? 'Action required' : 'Ready', hasPendingQuestion ? 'attention' : 'ready');
         setActivity(null);
         send.disabled = false;
       }
@@ -451,7 +462,13 @@ import { createConversationController } from './local-web-conversation-ui.js';
         typeof data.resolution === 'string'
       ) {
         resolveQuestion(data.questionId, data.resolution);
-        setState('Ready', 'ready');
+        if (data.continuesTurn === true) {
+          setState('Working', 'busy');
+          setActivity('Thinking…');
+        } else {
+          setState('Ready', 'ready');
+          setActivity(null);
+        }
       }
     } catch {
       // same: one bad frame never stops the page
@@ -502,7 +519,8 @@ import { createConversationController } from './local-web-conversation-ui.js';
       event.key === 'Escape' &&
       mobileSidebar.matches &&
       appShell.classList.contains('sidebar-open') &&
-      !createDialog.open
+      !createDialog.open &&
+      !deleteDialog.open
     ) {
       event.preventDefault();
       setSidebarOpen(false, { restoreFocus: true });
@@ -512,14 +530,18 @@ import { createConversationController } from './local-web-conversation-ui.js';
   function renderCatalog(catalog) {
     agentList.replaceChildren();
     for (const conversation of catalog.conversations) {
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.className = 'agent-row';
-      button.dataset.conversationId = conversation.conversationId;
-      button.setAttribute(
+      const row = document.createElement('div');
+      row.className = 'agent-row';
+      row.dataset.conversationId = conversation.conversationId;
+      row.setAttribute(
         'aria-current',
         String(conversationController?.selected?.conversationId === conversation.conversationId),
       );
+
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'agent-row-select';
+      button.setAttribute('aria-label', `Open ${conversation.agentName}`);
 
       const avatar = document.createElement('span');
       avatar.className = 'agent-avatar';
@@ -550,11 +572,37 @@ import { createConversationController } from './local-web-conversation-ui.js';
           addMessage('system', error instanceof Error ? error.message : 'Conversation could not be selected.', false);
         }
       });
-      agentList.append(button);
+
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'agent-row-delete';
+      remove.setAttribute('aria-label', `Delete ${conversation.agentName}`);
+      remove.setAttribute('title', `Delete ${conversation.agentName}`);
+      remove.textContent = '×';
+      remove.addEventListener('click', () => openDeleteDialog(conversation));
+
+      row.append(button, remove);
+      agentList.append(row);
     }
   }
 
   function selectConversation(conversation, items) {
+    if (!conversation) {
+      agentTitle.textContent = 'No agents';
+      agentRuntime.textContent = 'Create an agent to start';
+      input.placeholder = 'Create an agent to start chatting';
+      input.disabled = true;
+      send.disabled = true;
+      setActivity(null);
+      setState('Ready', 'ready');
+      transcript = [];
+      messages.replaceChildren();
+      renderEmptyState({ heading: 'No agents yet', body: 'Create an agent from the sidebar to start chatting.' });
+      if (conversationController?.catalog) renderCatalog(conversationController.catalog);
+      syncChrome();
+      return;
+    }
+    input.disabled = false;
     agentTitle.textContent = conversation.agentName;
     agentRuntime.textContent = runtimeLabel(conversation);
     input.placeholder = `Message ${conversation.agentName}…`;
@@ -592,13 +640,14 @@ import { createConversationController } from './local-web-conversation-ui.js';
   function openCreateDialog() {
     const selected = conversationController?.selected;
     const catalog = conversationController?.catalog;
-    if (!selected || !catalog) return;
+    if (!catalog) return;
     createForm.reset();
     advancedOptions.open = false;
     showCreateError('');
     setCreating(false);
-    inheritAgent.textContent = selected.agentName;
-    inheritRuntime.textContent = runtimeLabel(selected);
+    inheritanceSummary.hidden = !selected;
+    inheritAgent.textContent = selected?.agentName || '';
+    inheritRuntime.textContent = selected ? runtimeLabel(selected) : '';
 
     providerSelect.replaceChildren();
     for (const provider of catalog.installedProviders) {
@@ -607,18 +656,18 @@ import { createConversationController } from './local-web-conversation-ui.js';
       option.textContent = provider;
       providerSelect.append(option);
     }
-    const selectedProviderInstalled = catalog.installedProviders.includes(selected.provider);
+    const selectedProviderInstalled = Boolean(selected && catalog.installedProviders.includes(selected.provider));
     const fallbackProvider = catalog.isInstallationDefaultInstalled
       ? catalog.installationDefault
       : catalog.installedProviders[0];
     providerSelect.value = selectedProviderInstalled ? selected.provider : fallbackProvider;
-    providerWasChanged = providerSelect.value !== selected.provider;
+    providerWasChanged = Boolean(selected && providerSelect.value !== selected.provider);
     providerField.hidden = catalog.installedProviders.length <= 1;
     singleProvider.hidden = catalog.installedProviders.length > 1;
     singleProvider.textContent = `Provider: ${providerSelect.value}`;
-    modelInput.value = providerWasChanged ? '' : selected.model || '';
-    effortSelect.value = providerWasChanged ? '' : selected.effort || '';
-    if (!selectedProviderInstalled) {
+    modelInput.value = providerWasChanged ? '' : selected?.model || '';
+    effortSelect.value = providerWasChanged ? '' : selected?.effort || '';
+    if (selected && !selectedProviderInstalled) {
       showCreateError(
         `The selected agent uses ${selected.provider}, which is not installed. Choose an installed provider.`,
       );
@@ -632,6 +681,31 @@ import { createConversationController } from './local-web-conversation-ui.js';
     createAgentButton.focus();
   }
 
+  function showDeleteError(message) {
+    deleteError.textContent = message;
+    deleteError.hidden = !message;
+  }
+
+  function setDeleting(deleting) {
+    submitDeleteAgent.disabled = deleting;
+    submitDeleteAgent.textContent = deleting ? 'Deleting…' : 'Delete agent';
+  }
+
+  function openDeleteDialog(conversation) {
+    pendingDeleteConversation = conversation;
+    deleteAgentName.textContent = conversation.agentName;
+    showDeleteError('');
+    setDeleting(false);
+    deleteDialog.showModal();
+    cancelDeleteAgent.focus();
+  }
+
+  function closeDeleteDialog() {
+    pendingDeleteConversation = null;
+    deleteDialog.close();
+    createAgentButton.focus();
+  }
+
   providerSelect.addEventListener('change', () => {
     const selected = conversationController?.selected;
     providerWasChanged = providerSelect.value !== selected?.provider;
@@ -642,6 +716,8 @@ import { createConversationController } from './local-web-conversation-ui.js';
   createAgentButton.addEventListener('click', openCreateDialog);
   closeCreateAgent.addEventListener('click', closeCreateDialog);
   cancelCreateAgent.addEventListener('click', closeCreateDialog);
+  closeDeleteAgent.addEventListener('click', closeDeleteDialog);
+  cancelDeleteAgent.addEventListener('click', closeDeleteDialog);
   createForm.addEventListener('submit', async (event) => {
     event.preventDefault();
     showCreateError('');
@@ -660,6 +736,24 @@ import { createConversationController } from './local-web-conversation-ui.js';
       showCreateError(error instanceof Error ? error.message : 'Agent could not be created.');
     } finally {
       setCreating(false);
+    }
+  });
+  deleteForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const conversation = pendingDeleteConversation;
+    if (!conversation) return;
+    showDeleteError('');
+    setDeleting(true);
+    try {
+      await conversationController.deleteAgent(conversation.conversationId);
+      pendingDeleteConversation = null;
+      deleteDialog.close();
+      if (conversationController.selected) input.focus();
+      else createAgentButton.focus();
+    } catch (error) {
+      showDeleteError(error instanceof Error ? error.message : 'Agent could not be deleted.');
+    } finally {
+      setDeleting(false);
     }
   });
 

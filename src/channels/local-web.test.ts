@@ -193,6 +193,13 @@ describe('local web adapter', () => {
       });
       expect(message.status).toBe(401);
 
+      const deletion = await fetch(`${url}/api/agents`, {
+        method: 'DELETE',
+        headers: forged,
+        body: JSON.stringify({ conversationId: 'mg-web' }),
+      });
+      expect(deletion.status).toBe(401);
+
       const stream = await fetch(`${url}/events?conversationId=mg-web`, {
         headers: { origin: url },
         signal: abort.signal,
@@ -271,6 +278,46 @@ describe('local web adapter', () => {
     }
   });
 
+  it('discovers agent groups created after channel startup without duplicating conversations', async () => {
+    const { registry, url, auth } = await startAdapter();
+    try {
+      const { createAgentGroup } = await import('../db/agent-groups.js');
+      await createAgentGroup({
+        id: 'ag-late',
+        name: 'Late Agent',
+        folder: 'late-agent',
+        agent_provider: null,
+        created_at: new Date().toISOString(),
+      });
+
+      const [first, concurrent] = await Promise.all([
+        fetch(`${url}/api/conversations`, { headers: { ...auth, origin: url } }),
+        fetch(`${url}/api/conversations`, { headers: { ...auth, origin: url } }),
+      ]);
+      expect(first.status).toBe(200);
+      expect(concurrent.status).toBe(200);
+      expect(await first.json()).toMatchObject({
+        conversations: expect.arrayContaining([
+          expect.objectContaining({ agentName: 'Late Agent', provider: 'claude' }),
+        ]),
+      });
+
+      const second = await fetch(`${url}/api/conversations`, { headers: { ...auth, origin: url } });
+      expect(second.status).toBe(200);
+      const { getDb } = await import('../db/connection.js');
+      expect(
+        await getDb().get<{ conversations: number; wirings: number; destinations: number }>(
+          `SELECT
+             (SELECT COUNT(*) FROM messaging_groups WHERE platform_id = 'local-web:agent:ag-late') AS conversations,
+             (SELECT COUNT(*) FROM messaging_group_agents WHERE agent_group_id = 'ag-late') AS wirings,
+             (SELECT COUNT(*) FROM agent_destinations WHERE agent_group_id = 'ag-late') AS destinations`,
+        ),
+      ).toEqual({ conversations: 1, wirings: 1, destinations: 1 });
+    } finally {
+      await registry.teardownChannelAdapters();
+    }
+  });
+
   it('creates and resumes an agent through the narrow browser endpoint', async () => {
     const { registry, url, auth } = await startAdapter();
     try {
@@ -331,6 +378,53 @@ describe('local web adapter', () => {
              (SELECT COUNT(*) FROM sessions) AS sessions`,
         ),
       ).toEqual({ groups: 1, conversations: 2, wirings: 2, destinations: 2, sessions: 0 });
+      expect(
+        await getDb().get<{ messaging_group_name: string; local_name: string }>(
+          `SELECT mg.name AS messaging_group_name, ad.local_name
+             FROM agent_groups ag
+             JOIN messaging_group_agents mga ON mga.agent_group_id = ag.id
+             JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+             JOIN agent_destinations ad
+               ON ad.agent_group_id = ag.id AND ad.target_type = 'channel' AND ad.target_id = mg.id
+            WHERE ag.folder = 'web-writer'`,
+        ),
+      ).toEqual({ messaging_group_name: 'User', local_name: 'user' });
+    } finally {
+      await registry.teardownChannelAdapters();
+    }
+  });
+
+  it('deletes agents through the existing group command and permits an empty catalog', async () => {
+    const { registry, url, auth } = await startAdapter();
+    try {
+      const headers = { ...auth, 'content-type': 'application/json', origin: url };
+      const extraAuthority = await fetch(`${url}/api/agents`, {
+        method: 'DELETE',
+        headers,
+        body: JSON.stringify({ conversationId: 'mg-web', agentGroupId: 'ag-web' }),
+      });
+      expect(extraAuthority.status).toBe(400);
+
+      const deleted = await fetch(`${url}/api/agents`, {
+        method: 'DELETE',
+        headers,
+        body: JSON.stringify({ conversationId: 'mg-web' }),
+      });
+      expect(deleted.status).toBe(200);
+      expect(await deleted.json()).toMatchObject({
+        conversation: { conversationId: 'mg-web', agentName: 'Web Agent' },
+      });
+
+      const catalog = await fetch(`${url}/api/conversations`, { headers: { ...auth, origin: url } });
+      expect(catalog.status).toBe(200);
+      expect(await catalog.json()).toMatchObject({ conversations: [] });
+
+      const missing = await fetch(`${url}/api/agents`, {
+        method: 'DELETE',
+        headers,
+        body: JSON.stringify({ conversationId: 'mg-web' }),
+      });
+      expect(missing.status).toBe(404);
     } finally {
       await registry.teardownChannelAdapters();
     }
@@ -487,10 +581,24 @@ describe('local web adapter', () => {
     }
   });
 
-  it('renders pending questions and resolves their server-owned option value', async () => {
+  it('resolves a pending question and resumes activity for that conversation', async () => {
     const { registry, actions, url, auth } = await startAdapter();
     const abort = new AbortController();
     try {
+      const { session } = await seedWebSession();
+      const outDb = openOutboundDbRw(outboundDbPath('ag-web', session.id));
+      try {
+        const now = new Date().toISOString();
+        outDb
+          .prepare(
+            `INSERT INTO container_state
+               (id, current_tool, tool_declared_timeout_ms, tool_started_at, updated_at)
+             VALUES (1, 'Bash', NULL, ?, ?)`,
+          )
+          .run(now, now);
+      } finally {
+        outDb.close();
+      }
       const { createPendingApproval } = await import('../db/sessions.js');
       await createPendingApproval({
         approval_id: 'appr-local-web',
@@ -516,7 +624,8 @@ describe('local web adapter', () => {
       });
       const reader = response.body!.getReader();
       await reader.read();
-      const messageId = await registry.createChannelDeliveryAdapter().deliver(
+      const delivery = registry.createChannelDeliveryAdapter();
+      const messageId = await delivery.deliver(
         'local-web',
         'local-web:local',
         null,
@@ -553,10 +662,13 @@ describe('local web adapter', () => {
       expect(action.status).toBe(202);
       expect(actions).toEqual([{ questionId: 'appr-local-web', selectedOption: 'approve', userId: 'local-web:local' }]);
       expect(new TextDecoder().decode((await reader.read()).value)).toContain(
-        '"type":"question-resolution","questionId":"appr-local-web","resolution":"Approved"',
+        '"type":"question-resolution","questionId":"appr-local-web","resolution":"Approved","continuesTurn":true',
       );
+      if (!delivery.setTyping) throw new Error('delivery adapter does not support typing');
+      await delivery.setTyping('local-web', 'local-web:local', null, 'local-web');
+      expect(new TextDecoder().decode((await reader.read()).value)).toContain('{"type":"tool","name":"Bash"}');
 
-      await registry.createChannelDeliveryAdapter().deliver(
+      await delivery.deliver(
         'local-web',
         'local-web:local',
         null,
@@ -569,7 +681,110 @@ describe('local web adapter', () => {
         undefined,
         'local-web',
       );
-      expect(new TextDecoder().decode((await reader.read()).value)).toContain('"resolution":"Timed out"');
+      const terminal = new TextDecoder().decode((await reader.read()).value);
+      expect(terminal).toContain('"resolution":"Timed out"');
+      expect(terminal).not.toContain('"continuesTurn":true');
+    } finally {
+      abort.abort();
+      await registry.teardownChannelAdapters();
+    }
+  });
+
+  it('keeps a sidebar agent approval card and its resolution in that agent conversation', async () => {
+    const { registry, actions, url, auth } = await startAdapter();
+    const abort = new AbortController();
+    try {
+      const created = await fetch(`${url}/api/agents`, {
+        method: 'POST',
+        headers: { ...auth, 'content-type': 'application/json', origin: url },
+        body: JSON.stringify({ name: 'Sidebar Agent', sourceConversationId: 'mg-web' }),
+      });
+      const body = (await created.json()) as { conversation: { conversationId: string } };
+      const { getDb } = await import('../db/connection.js');
+      const child = await getDb().get<{ agent_group_id: string; platform_id: string }>(
+        `SELECT mga.agent_group_id, mg.platform_id
+           FROM messaging_groups mg
+           JOIN messaging_group_agents mga ON mga.messaging_group_id = mg.id
+          WHERE mg.id = ?`,
+        body.conversation.conversationId,
+      );
+      if (!child) throw new Error('child conversation was not created');
+      const { resolveSession } = await import('../session-manager.js');
+      const { session } = await resolveSession(child.agent_group_id, body.conversation.conversationId, null, 'shared');
+      const { createPendingApproval } = await import('../db/sessions.js');
+      await createPendingApproval({
+        approval_id: 'appr-sidebar',
+        session_id: session.id,
+        request_id: 'appr-sidebar',
+        action: 'cli_command',
+        payload: '{}',
+        agent_group_id: child.agent_group_id,
+        channel_type: 'local-web',
+        platform_id: 'local-web:local',
+        instance: 'local-web',
+        created_at: new Date().toISOString(),
+        title: 'Approve sidebar action?',
+        question: 'This action belongs to Sidebar Agent.',
+        options_json: JSON.stringify([
+          { label: 'Approve', selectedLabel: 'Approved', value: 'approve', style: 'primary' },
+        ]),
+      });
+
+      const response = await fetch(`${url}/events?conversationId=${body.conversation.conversationId}`, {
+        headers: { ...auth, origin: url },
+        signal: abort.signal,
+      });
+      const reader = response.body!.getReader();
+      await reader.read();
+      const delivery = registry.createChannelDeliveryAdapter();
+      await delivery.deliver(
+        'local-web',
+        'local-web:local',
+        null,
+        'chat-sdk',
+        JSON.stringify({
+          type: 'ask_question',
+          questionId: 'appr-sidebar',
+          title: 'Approve sidebar action?',
+          question: 'This action belongs to Sidebar Agent.',
+          options: [],
+        }),
+        undefined,
+        'local-web',
+      );
+      expect(new TextDecoder().decode((await reader.read()).value)).toContain('Approve sidebar action?');
+
+      const action = await fetch(`${url}/api/actions`, {
+        method: 'POST',
+        headers: { ...auth, 'content-type': 'application/json', origin: url },
+        body: JSON.stringify({
+          conversationId: body.conversation.conversationId,
+          questionId: 'appr-sidebar',
+          option: 0,
+        }),
+      });
+      expect(action.status).toBe(202);
+      expect(actions).toContainEqual({
+        questionId: 'appr-sidebar',
+        selectedOption: 'approve',
+        userId: 'local-web:local',
+      });
+      await reader.read();
+
+      await delivery.deliver(
+        'local-web',
+        'local-web:local',
+        null,
+        'chat-sdk',
+        JSON.stringify({
+          operation: 'edit',
+          messageId: 'appr-sidebar',
+          terminalCard: { resolution: 'Completed' },
+        }),
+        undefined,
+        'local-web',
+      );
+      expect(new TextDecoder().decode((await reader.read()).value)).toContain('"resolution":"Completed"');
     } finally {
       abort.abort();
       await registry.teardownChannelAdapters();

@@ -23,8 +23,6 @@ vi.mock('../container-runner.js', () => ({
   buildAgentGroupImage: vi.fn().mockResolvedValue(undefined),
 }));
 
-vi.mock('../modules/agent-to-agent/write-destinations.js', () => ({ writeDestinations: vi.fn() }));
-
 import { materializeContainerJson } from '../container-config.js';
 import { getAgentGroupByFolder, createAgentGroup } from '../db/agent-groups.js';
 import { getContainerConfig, updateContainerConfigScalars } from '../db/container-configs.js';

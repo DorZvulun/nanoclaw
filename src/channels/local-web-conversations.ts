@@ -5,7 +5,7 @@ import { DEFAULT_AGENT_PROVIDER } from '../config.js';
 import { getAgentGroupByFolder } from '../db/agent-groups.js';
 import { getContainerConfig } from '../db/container-configs.js';
 import { getDb } from '../db/connection.js';
-import { getPendingApproval, getPendingQuestion } from '../db/sessions.js';
+import { getPendingApproval, getPendingQuestion, getSession } from '../db/sessions.js';
 import { assertValidGroupFolder } from '../group-folder.js';
 import { normalizeName } from '../modules/agent-to-agent/db/agent-destinations.js';
 import '../providers/index.js';
@@ -15,6 +15,7 @@ import type { AgentGroup } from '../types.js';
 export const LOCAL_WEB_CHANNEL_TYPE = 'local-web';
 export const LOCAL_WEB_LEGACY_PLATFORM_ID = 'local-web:local';
 export const LOCAL_WEB_USER_ID = LOCAL_WEB_LEGACY_PLATFORM_ID;
+export const LOCAL_WEB_USER_DESTINATION_NAME = 'User';
 
 const MODEL_PATTERN = /^[A-Za-z0-9._:/-]{1,128}$/;
 const CONTROL_CHARACTER_PATTERN = /\p{Cc}/u;
@@ -59,6 +60,16 @@ export type CreateLocalWebAgentResult =
       status: number;
       message: string;
       stage?: CreateStage;
+      detail?: string;
+    };
+
+export type DeleteLocalWebAgentResult =
+  | { ok: true; conversation: LocalWebConversation }
+  | {
+      ok: false;
+      reason: 'not_found' | 'delete_failed';
+      status: number;
+      message: string;
       detail?: string;
     };
 
@@ -205,14 +216,19 @@ export async function listLocalWebCatalog(): Promise<LocalWebCatalog> {
   };
 }
 
-export async function getLocalWebConversation(conversationId: string): Promise<LocalWebConversation | undefined> {
+async function conversationRow(conversationId: string): Promise<ConversationRow | undefined> {
   const rows = await getDb().all<ConversationRow>(
     `${CONVERSATION_SELECT} AND mg.id = ?`,
     LOCAL_WEB_CHANNEL_TYPE,
     LOCAL_WEB_CHANNEL_TYPE,
     conversationId,
   );
-  return rows.length === 1 ? toConversation(rows[0]!) : undefined;
+  return rows.length === 1 ? rows[0] : undefined;
+}
+
+export async function getLocalWebConversation(conversationId: string): Promise<LocalWebConversation | undefined> {
+  const row = await conversationRow(conversationId);
+  return row && toConversation(row);
 }
 
 async function conversationByAgent(agentGroupId: string): Promise<LocalWebConversation | undefined> {
@@ -261,10 +277,45 @@ export async function localWebQuestionBelongsToConversation(
 ): Promise<boolean> {
   const platformId = await localWebPlatformIdForConversation(conversationId);
   if (!platformId) return false;
+  const routedPlatformId = await localWebPlatformIdForQuestion(questionId);
+  if (routedPlatformId) return routedPlatformId === platformId;
   const question = await getPendingQuestion(questionId);
   if (question) return question.channel_type === LOCAL_WEB_CHANNEL_TYPE && question.platform_id === platformId;
   const approval = await getPendingApproval(questionId);
   return approval?.channel_type === LOCAL_WEB_CHANNEL_TYPE && approval.platform_id === platformId;
+}
+
+export async function localWebPlatformIdForQuestion(questionId: string): Promise<string | undefined> {
+  const pending = (await getPendingQuestion(questionId)) ?? (await getPendingApproval(questionId));
+  if (!pending?.session_id) return undefined;
+  const session = await getSession(pending.session_id);
+  if (!session) return undefined;
+
+  if (session.messaging_group_id) {
+    const origin = await getDb().get<{ platform_id: string }>(
+      `SELECT platform_id
+         FROM messaging_groups
+        WHERE id = ? AND channel_type = ? AND instance = ?`,
+      session.messaging_group_id,
+      LOCAL_WEB_CHANNEL_TYPE,
+      LOCAL_WEB_CHANNEL_TYPE,
+    );
+    if (origin) return origin.platform_id;
+  }
+
+  const conversation = await getDb().get<{ platform_id: string }>(
+    `SELECT mg.platform_id
+       FROM messaging_groups mg
+       JOIN messaging_group_agents mga ON mga.messaging_group_id = mg.id
+      WHERE mga.agent_group_id = ? AND mg.channel_type = ? AND mg.instance = ?
+      ORDER BY (mg.platform_id = ?) DESC, mg.id ASC
+      LIMIT 1`,
+    session.agent_group_id,
+    LOCAL_WEB_CHANNEL_TYPE,
+    LOCAL_WEB_CHANNEL_TYPE,
+    LOCAL_WEB_LEGACY_PLATFORM_ID,
+  );
+  return conversation?.platform_id;
 }
 
 function platformIdForAgent(agentGroupId: string): string {
@@ -310,7 +361,7 @@ async function ensureConversation(agent: AgentGroup): Promise<StageResult> {
     channel_type: LOCAL_WEB_CHANNEL_TYPE,
     instance: LOCAL_WEB_CHANNEL_TYPE,
     platform_id: platformId,
-    name: agent.name,
+    name: LOCAL_WEB_USER_DESTINATION_NAME,
     is_group: 0,
   });
   if (!conversation.ok) return conversation;
@@ -320,6 +371,33 @@ async function ensureConversation(agent: AgentGroup): Promise<StageResult> {
     platform_id: platformId,
     agent_group_id: agent.id,
   });
+}
+
+export async function deleteLocalWebAgent(conversationId: string): Promise<DeleteLocalWebAgentResult> {
+  const row = await conversationRow(conversationId);
+  if (!row) {
+    return {
+      ok: false,
+      reason: 'not_found',
+      status: 404,
+      message: 'The selected agent is no longer available.',
+    };
+  }
+
+  const response = await dispatch(
+    { id: `local-web-${randomUUID()}`, command: 'groups-delete', args: { id: row.agent_group_id } },
+    { caller: 'host' },
+  );
+  if (!response.ok) {
+    return {
+      ok: false,
+      reason: 'delete_failed',
+      status: 409,
+      message: `Agent deletion failed: ${response.error.message}`,
+      detail: response.error.message,
+    };
+  }
+  return { ok: true, conversation: toConversation(row) };
 }
 
 export async function ensureLocalWebConversations(): Promise<void> {

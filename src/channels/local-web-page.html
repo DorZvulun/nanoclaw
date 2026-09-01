@@ -202,6 +202,29 @@
         </div>
       </form>
     </dialog>
+    <dialog
+      id="delete-agent-dialog"
+      class="create-agent-dialog delete-agent-dialog"
+      aria-labelledby="delete-agent-title"
+    >
+      <form id="delete-agent-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="dialog-kicker">Remove agent</p>
+            <h2 id="delete-agent-title">Delete <span id="delete-agent-name"></span>?</h2>
+          </div>
+          <button id="close-delete-agent" class="icon-button" type="button" aria-label="Close delete agent dialog">
+            ×
+          </button>
+        </div>
+        <p class="delete-agent-copy">This removes the agent and its NanoClaw conversations. This cannot be undone.</p>
+        <p id="delete-agent-error" class="form-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button id="cancel-delete-agent" class="secondary-button" type="button">Cancel</button>
+          <button id="submit-delete-agent" class="danger-button" type="submit">Delete agent</button>
+        </div>
+      </form>
+    </dialog>
     <script src="/local-web-page.js" type="module"></script>
   </body>
 </html>

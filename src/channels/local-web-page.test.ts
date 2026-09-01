@@ -47,6 +47,29 @@ describe('local web page assets', () => {
     expect(script).toContain('agentSidebar.inert = drawerIsClosed');
     expect(script).toContain('sidebarScrim.hidden = !drawerOpen');
     expect(script).toContain("mobileSidebar.addEventListener('change'");
+    expect(html).toContain('id="delete-agent-dialog"');
+    expect(html).toContain('id="submit-delete-agent"');
+    expect(script).toContain('conversationController.deleteAgent(conversation.conversationId)');
+    expect(script).toContain("heading: 'No agents yet'");
     expect(script).toContain('pnpm local-web');
+  });
+
+  it('keeps a resumed question turn visibly working', () => {
+    const script = fs.readFileSync(path.join(process.cwd(), 'src/channels/local-web-page.js'), 'utf8');
+
+    expect(script).toMatch(
+      /resolveQuestion\(card\.questionId, option\.selectedLabel \|\| option\.label\);\s+setState\('Working', 'busy'\);\s+setActivity\('Thinking…'\);/,
+    );
+    expect(script).toMatch(
+      /resolveQuestion\(data\.questionId, data\.resolution\);\s+if \(data\.continuesTurn === true\) \{\s+setState\('Working', 'busy'\);\s+setActivity\('Thinking…'\);\s+\} else \{\s+setState\('Ready', 'ready'\);\s+setActivity\(null\);/,
+    );
+  });
+
+  it('does not let a reconnect ready frame hide a queued action card', () => {
+    const script = fs.readFileSync(path.join(process.cwd(), 'src/channels/local-web-page.js'), 'utf8');
+
+    expect(script).toMatch(
+      /if \(data\.type === 'ready'\) \{\s+const hasPendingQuestion = transcript\.some\(\(item\) => item\.type === 'question' && !item\.resolution\);\s+setState\(hasPendingQuestion \? 'Action required' : 'Ready', hasPendingQuestion \? 'attention' : 'ready'\);/,
+    );
   });
 });
