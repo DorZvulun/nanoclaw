@@ -30,6 +30,7 @@ vi.mock('../../config.js', async (importOriginal) => ({
 const {
   mockRequestApproval,
   mockGetContainerConfig,
+  mockUpdateContainerConfigScalars,
   mockCreateAgentGroup,
   mockInitGroupFilesystem,
   mockWriteDestinations,
@@ -39,6 +40,7 @@ const {
 } = vi.hoisted(() => ({
   mockRequestApproval: vi.fn().mockResolvedValue(undefined),
   mockGetContainerConfig: vi.fn(),
+  mockUpdateContainerConfigScalars: vi.fn(),
   mockCreateAgentGroup: vi.fn(),
   mockInitGroupFilesystem: vi.fn(),
   mockWriteDestinations: vi.fn(),
@@ -57,6 +59,7 @@ vi.mock('../approvals/index.js', () => ({
 vi.mock('../../db/container-configs.js', () => ({
   getContainerConfig: (...a: unknown[]) => mockGetContainerConfig(...a),
   ensureContainerConfig: () => {},
+  updateContainerConfigScalars: (...a: unknown[]) => mockUpdateContainerConfigScalars(...a),
 }));
 vi.mock('../../db/agent-groups.js', () => ({
   getAgentGroup: (id: string) => ({ id, name: id.toUpperCase(), folder: id, agent_provider: null, created_at: '' }),
@@ -152,13 +155,20 @@ describe('create_agent — guard-based authorization (wrapped delivery action)',
     expect(mockInitGroupFilesystem).toHaveBeenCalledTimes(1);
   });
 
-  it('child inherits the creator provider (codex parent → codex child)', async () => {
+  it('child inherits the creator provider, model and effort', async () => {
     // A subagent must run on the same authenticated runtime as its creator —
-    // on a codex-only install a claude default would 401. The provider is
-    // passed to initGroupFilesystem, which stamps the child's config row.
-    // Red-on-delete: dropping the inheritance lets the child fall through to the
-    // instance default instead of codex.
-    mockGetContainerConfig.mockReturnValue({ cli_scope: 'global', provider: 'codex' });
+    // on a codex-only install a claude default would 401, and on a local-model
+    // install the cloud default model would leave the daemon entirely. The
+    // provider is passed to initGroupFilesystem, which stamps the child's
+    // config row; model and effort are stamped straight after.
+    // Red-on-delete: dropping either lets the child fall through to the
+    // instance defaults.
+    mockGetContainerConfig.mockReturnValue({
+      cli_scope: 'global',
+      provider: 'codex',
+      model: 'local/qwen',
+      effort: 'high',
+    });
 
     await runCreateAgent({ name: 'Scout', instructions: 'help' });
 
@@ -166,6 +176,19 @@ describe('create_agent — guard-based authorization (wrapped delivery action)',
       expect.anything(),
       expect.objectContaining({ provider: 'codex' }),
     );
+    const child = mockCreateAgentGroup.mock.calls[0][0];
+    expect(mockUpdateContainerConfigScalars).toHaveBeenCalledWith(child.id, {
+      model: 'local/qwen',
+      effort: 'high',
+    });
+  });
+
+  it('stamps nothing when the creator set no model or effort', async () => {
+    mockGetContainerConfig.mockReturnValue({ cli_scope: 'global', provider: 'codex' });
+
+    await runCreateAgent({ name: 'Scout', instructions: 'help' });
+
+    expect(mockUpdateContainerConfigScalars).not.toHaveBeenCalled();
   });
 
   it('claude creator pins the child to claude, not the instance default', async () => {
