@@ -4,6 +4,7 @@ Remove the launch-owned model mappings created by this skill:
 
 ```bash
 rm -rf data/provider-state/ollama
+rm -f data/ollama-launch-pending data/ollama-launch-pending.tmp
 ```
 
 Use `/add-local-web-chat/REMOVE.md` and `/add-ollama-provider/REMOVE.md`

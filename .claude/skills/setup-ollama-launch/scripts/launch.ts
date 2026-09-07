@@ -601,6 +601,15 @@ async function main(): Promise<number> {
   await warmOllama(baseUrl, runtimeModel);
   if (contextLength !== undefined) await verifyOllamaContext(baseUrl, runtimeModel, contextLength);
 
+  // Copying files and persisting configuration do not prove the running service
+  // adopted them. Keep this marker through every failure, including a retry
+  // whose files already match. Its optional contents retain a welcome not sent yet.
+  const pendingLaunchFile = path.join(DATA_DIR, 'ollama-launch-pending');
+  const launchWasPending = fs.existsSync(pendingLaunchFile);
+  const pendingWelcome = launchWasPending ? fs.readFileSync(pendingLaunchFile, 'utf8').trim() : '';
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!launchWasPending) fs.writeFileSync(pendingLaunchFile, '', { mode: 0o600 });
+
   const providerChanged = await applyBundledSkill('add-ollama-provider');
   const localWebChanged = await applyBundledSkill('add-local-web-chat');
   const skillsChanged = providerChanged || localWebChanged;
@@ -613,7 +622,7 @@ async function main(): Promise<number> {
     runSetupStep('container', [], { ...process.env, DOCKER_BUILDKIT: '1' });
     runSetupStep('onecli', hasReusableOnecli() ? ['--reuse'] : []);
     runSetupStep('mounts', ['--empty']);
-  } else if (providerPayloadNeedsContainerBuild(onboarded, providerChanged)) {
+  } else if (providerPayloadNeedsContainerBuild(onboarded, providerChanged || launchWasPending)) {
     runSetupStep('container', [], { ...process.env, DOCKER_BUILDKIT: '1' });
   }
 
@@ -656,24 +665,36 @@ async function main(): Promise<number> {
   // Wire before service startup: the multi-agent adapter backfills every group
   // without a local-web conversation as soon as the service starts.
   const webWiring = await ensureWebWiring(agentGroup.id);
+  if (webWiring.newlyWired) {
+    fs.writeFileSync(`${pendingLaunchFile}.tmp`, webWiring.conversationId, { mode: 0o600 });
+    fs.renameSync(`${pendingLaunchFile}.tmp`, pendingLaunchFile);
+  }
   await db.close();
 
   // Rebuild only for a first install, newly-applied files, or a config change.
   // Warm before restart and queue the wiring welcome only after the web channel is ready.
-  if (!onboarded || skillsChanged || configChanged || runtimeModelChanged || !(await webChatIsReady(webUrl))) {
+  if (
+    !onboarded ||
+    launchWasPending ||
+    skillsChanged ||
+    configChanged ||
+    runtimeModelChanged ||
+    !(await webChatIsReady(webUrl))
+  ) {
     runSetupStep('service');
   }
 
   await waitForWebChat(webUrl);
-  if (skillsChanged || configChanged || runtimeModelChanged) {
+  if (launchWasPending || skillsChanged || configChanged || runtimeModelChanged) {
     await waitForCli();
     restartAgentGroup(agentGroup.id);
   }
   const token = localWebToken();
   if (!token) throw new LaunchError(1, `web chat answered at ${webUrl} but minted no access token; check logs/`);
-  if (webWiring.newlyWired) {
+  if (webWiring.newlyWired || pendingWelcome === webWiring.conversationId) {
     await sendWiringWelcome(webUrl, token, webWiring.conversationId);
   }
+  fs.unlinkSync(pendingLaunchFile);
 
   // Fragment, so the page can store and strip it before the URL reaches browser
   // history. openUrl is best-effort and silent on failure, and isHeadless() is

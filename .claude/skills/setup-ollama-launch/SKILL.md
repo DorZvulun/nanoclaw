@@ -25,7 +25,7 @@ pnpm run build
 ```
 
 ```nc:run effect:test
-pnpm exec vitest run scripts/ollama-launch.test.ts
+pnpm exec vitest run scripts/ollama-launch.test.ts scripts/ollama-launch-recovery.test.ts
 ```
 
 ## Run the deterministic launcher
@@ -54,6 +54,8 @@ user.
 The launcher creates the selected agent's opaque local-web conversation before
 the service starts, then queues the standard `/welcome` turn into that exact
 conversation. Later launches and browser reconnects do not repeat it. The
+launcher retains incomplete activation and an unsent welcome across failed
+launches, so a retry finishes the work even when the files already match. The
 browser can create and switch additional agents; each gets its own messaging
 group, wiring, session, transcript, activity, and question stream while keeping
 the same machine-local human identity.
