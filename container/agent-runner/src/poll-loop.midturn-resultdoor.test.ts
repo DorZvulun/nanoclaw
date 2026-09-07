@@ -469,6 +469,33 @@ describe('DB-visible sends gate the nudge', () => {
     expect(deliveredTexts()).toEqual(['sent via tool']);
     expect(nudges(pushes)).toHaveLength(0);
   });
+
+  it('also suppresses the nudge for a result-door provider after MCP send_message', async () => {
+    // A provider whose only content door is the result (textDelivery:
+    // 'result') still reaches the MCP tool. Without the DB-visible check the
+    // plain summary that follows reads as undelivered and the nudge fires,
+    // so the model sends the same reply a second time.
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      const { writeMessageOut } = await import('./db/messages-out.js');
+      writeMessageOut({
+        id: 'mcp-result-door-1',
+        kind: 'chat',
+        platform_id: 'chan-1',
+        channel_type: 'discord',
+        thread_id: null,
+        content: JSON.stringify({ text: 'sent via tool' }),
+      });
+      yield { type: 'result', text: 'Done — sent it through the tool.' };
+    }
+    const { query, pushes } = makeStubQuery(events());
+
+    await processQuery(query, CHAT_ROUTING, ['m1'], 'ollama', undefined, 'prompt', undefined, false);
+
+    expect(deliveredTexts()).toEqual(['sent via tool']);
+    expect(nudges(pushes)).toHaveLength(0);
+  });
 });
 
 // ── Failure ordering — mid-turn outbound write fails ──

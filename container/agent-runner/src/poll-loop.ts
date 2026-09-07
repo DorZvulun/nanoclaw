@@ -582,10 +582,11 @@ export async function processQuery(
             // "Did anything user-visible go out this turn?" — door
             // deliveries (midTurnSent) plus any chat row written since the
             // turn boundary (which also sees MCP send_message calls the
-            // frame-local count can't). When false and the result still
-            // carries content, the wrap-nudge fires so the model re-sends
-            // and the retry streams through the mid-turn door.
-            turnDelivered: midTurnCompleteDelivery ? midTurnSent > 0 || chatRowWrittenSince(turnStartSeq) : undefined,
+            // frame-local count can't). Computed for every provider: a
+            // result-door provider whose agent sent through the MCP tool has
+            // delivered just as surely, and nudging it would only get the
+            // same reply a second time.
+            turnDelivered: midTurnSent > 0 || chatRowWrittenSince(turnStartSeq),
           });
           const willRetryTaskBlocks = shouldNudgeTaskBlocks(routing.taskRun, taskBlocks, taskBlockNudged);
           // One-door task delivery: the final text becomes the run log entry
@@ -763,16 +764,17 @@ export interface ResultDispatchOptions {
    */
   suppressDelivery?: boolean;
   /**
-   * Did anything user-visible go out this turn? True when the mid-turn door
-   * delivered (midTurnSent > 0) OR any chat row landed in outbound.db since
-   * the turn boundary (covers MCP send_message calls the frame-local count
-   * cannot see). Only meaningful with `suppressDelivery`. When false and the
-   * result carries content — wrapped blocks or unwrapped prose — the turn
-   * counts as undelivered and the wrap-nudge fires, so the model re-sends
-   * and the retry streams through the mid-turn door. This is the deliberate
-   * degradation path for streaming-door misses (SDK drift, a destination
-   * appearing only after streaming, a block that never closed): nudge and
-   * retry, never a direct result-door send.
+   * Did anything user-visible go out this turn before this dispatch? True
+   * when the mid-turn door delivered (midTurnSent > 0) OR any chat row landed
+   * in outbound.db since the turn boundary (covers MCP send_message calls the
+   * frame-local count cannot see). It combines with this dispatch's own send
+   * count to answer the nudge question, so it means the same thing at both
+   * doors. When nothing was delivered and the result carries content —
+   * wrapped blocks or unwrapped prose — the turn counts as undelivered and
+   * the wrap-nudge fires, so the model re-sends. For a mid-turn delivery
+   * provider that is the deliberate degradation path for streaming-door
+   * misses (SDK drift, a destination appearing only after streaming, a block
+   * that never closed): nudge and retry, never a direct result-door send.
    */
   turnDelivered?: boolean;
 }
@@ -1079,10 +1081,12 @@ export async function dispatchResultText(
 
   // In a task run, plain final text is the NORMAL ending (it becomes the run
   // log) — never treat it as an undelivered reply or nudge the agent to wrap it.
-  // With suppressDelivery the delivered-this-turn question is answered by
-  // turnDelivered (door deliveries + DB-visible sends like MCP send_message);
-  // otherwise by this dispatch's own send count.
-  const anythingDelivered = options?.suppressDelivery ? options.turnDelivered === true : sent > 0;
+  // This dispatch's own send count plus anything already delivered this turn
+  // (door deliveries and DB-visible sends like MCP send_message). A result-door
+  // provider sends from here, so its count is usually the whole answer — but an
+  // MCP send followed by a plain summary delivered without it, and nudging
+  // would get the same reply twice.
+  const anythingDelivered = sent > 0 || options?.turnDelivered === true;
   const hasUnwrapped = !routing.taskRun && !anythingDelivered && !!scratchpad;
   if (hasUnwrapped) {
     log(`WARNING: agent output had no <message to="..."> blocks — nothing was sent`);
