@@ -126,6 +126,14 @@ export interface ProviderHostContract {
   files: readonly ProviderPreparedFile[];
   /** Present only when the mixed-version compatibility adapter must be registered. */
   legacyHostAdapter?: 'required';
+  /**
+   * Hostnames the agent container must resolve to 0.0.0.0. Declared here
+   * because core keeps only `env` from a legacy adapter's contribution once a
+   * contract exists: a provider that routes inference away from the cloud
+   * states the endpoints it must not be able to reach, and core carries them
+   * onto the container spec.
+   */
+  blockedHosts?: readonly string[];
   commands?: {
     nativeAdmin?: readonly string[];
     nativeFiltered?: readonly string[];
@@ -196,6 +204,11 @@ export function assertProviderHostContractShape(provider: string, contract: Prov
   }
   if (contract.legacyHostAdapter !== undefined) {
     assertAllowed(contract.legacyHostAdapter, ['required'], `${provider}.legacyHostAdapter`);
+  }
+  if (contract.blockedHosts !== undefined) {
+    assertArray(contract.blockedHosts, `${provider}.blockedHosts`);
+    for (const host of contract.blockedHosts) assertHostname(host, `${provider}.blockedHosts[]`);
+    unique(contract.blockedHosts, `${provider}.blockedHosts`);
   }
   assertCommandArray(contract.commands?.nativeAdmin, `${provider}.commands.nativeAdmin`);
   assertCommandArray(contract.commands?.nativeFiltered, `${provider}.commands.nativeFiltered`);
@@ -413,6 +426,12 @@ function assertReference(values: ReadonlySet<string>, value: string, field: stri
 function assertName(value: unknown, field: string): asserts value is string {
   if (typeof value !== 'string' || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value)) {
     throw new Error(`${field} must be lowercase kebab-case`);
+  }
+}
+
+function assertHostname(value: unknown, field: string): asserts value is string {
+  if (typeof value !== 'string' || !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/i.test(value)) {
+    throw new Error(`${field} must be a bare hostname`);
   }
 }
 

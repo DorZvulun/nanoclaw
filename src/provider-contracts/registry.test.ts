@@ -144,6 +144,28 @@ describe('provider host contracts', () => {
     expect(() => (stored.commands!.nativeAdmin as string[]).push('/later')).toThrow();
   });
 
+  describe('blockedHosts', () => {
+    it('stores and freezes a declared list', () => {
+      const name = contractName('blocked-hosts', 'declared');
+      registerProviderHostContract(name, { ...emptyContract(), blockedHosts: ['api.anthropic.com', 'claude.ai'] });
+      const hosts = getProviderHostContract(name)!.blockedHosts!;
+      expect(hosts).toEqual(['api.anthropic.com', 'claude.ai']);
+      expect(Object.isFrozen(hosts)).toBe(true);
+    });
+
+    it.each([
+      ['a non-array', 'api.anthropic.com', /blockedHosts must be an array/],
+      ['a host with a port', ['api.anthropic.com:443'], /blockedHosts\[\] must be a bare hostname/],
+      ['a URL', ['https://claude.ai'], /blockedHosts\[\] must be a bare hostname/],
+      ['an empty host', [''], /blockedHosts\[\] must be a bare hostname/],
+      ['a duplicate', ['claude.ai', 'claude.ai'], /blockedHosts must be unique; duplicate 'claude.ai'/],
+    ])('rejects %s at registration and stores nothing', (_label, blockedHosts, expected) => {
+      const name = contractName('blocked-hosts', 'invalid');
+      expect(() => registerProviderHostContract(name, { ...emptyContract(), blockedHosts } as never)).toThrow(expected);
+      expect(hasDeclaredProviderContract(name)).toBe(false);
+    });
+  });
+
   describe('inference.speedTiers', () => {
     it('is declared by Claude as standard and fast', () => {
       expect(getProviderHostContract('claude')?.inference?.speedTiers).toEqual(['standard', 'fast']);

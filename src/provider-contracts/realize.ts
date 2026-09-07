@@ -125,8 +125,14 @@ export async function realizeProviderSpawnSurfaces(
   // A registered legacy adapter still contributes env exactly as before this
   // contract existed; only its mounts are dropped, since core now realizes
   // every declared surface. Nothing in the contract switches this on or off.
+  // Blocked hosts are the contract's own declaration, not the overlay's: they
+  // gate what the container can reach, so they must survive on a spawn path
+  // that keeps nothing else the overlay returns.
   const overlay = await actions.legacyOverlay();
-  const contribution = overlay.env ? { env: overlay.env } : {};
+  const contribution = {
+    ...(overlay.env ? { env: overlay.env } : {}),
+    ...(contract.blockedHosts ? { blockedHosts: [...contract.blockedHosts] } : {}),
+  };
 
   for (const volume of contract.stateVolumes) {
     const hostPath = providerStateVolumePath(volume, agentGroupId, sessionDirectory);
