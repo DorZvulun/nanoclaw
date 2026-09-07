@@ -119,6 +119,12 @@ operator to run that snippet themselves with `echo "$URL"` on the end, in their
 own terminal. Anyone who can read `data/local-web/token` can use the chat; the
 file is `0600` and is never mounted into an agent container.
 
+Replies waiting in other conversations show an unread badge and an in-app
+notice with an Open conversation button. Opening that conversation consumes
+its queued replies and clears the badge. These notices use the channel's
+existing in-memory queue; they do not change agent-to-agent routing or send
+automatic messages to a parent agent.
+
 The shared wiring command queues the standard `/welcome` turn. Opening or
 reconnecting the browser never creates a message.
 To choose another port, persist it before the restart step and offer that URL
