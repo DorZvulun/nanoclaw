@@ -1,4 +1,10 @@
-import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
+import {
+  query as sdkQuery,
+  type HookCallback,
+  type Options,
+  type PermissionMode,
+  type PreCompactHookInput,
+} from '@anthropic-ai/claude-agent-sdk';
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/container-state.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
@@ -8,13 +14,7 @@ import type { ResolvedRuntimeConfiguration } from '../provider-contracts/registr
 // declares them; core calls them and hands the results to this provider's
 // constructor and registerMemorySessionHook. This module never imports the
 // contract — registration is two-step so it compiles on a core without one.
-import {
-  SDK_DISALLOWED_TOOLS,
-  type resolveClaudeExecutionPolicy,
-  type resolveClaudeInference,
-  type resolveClaudeMcpServers,
-  type resolveClaudeMemoryRuntime,
-} from './claude-config.js';
+import type { resolveClaudeMcpServers, resolveClaudeMemoryRuntime } from './claude-config.js';
 // Transcript archiving and rotation are this provider's own concern: both
 // read the SDK's on-disk .jsonl, which no other provider has.
 import { archiveClaudeTranscript, rotateClaudeContinuation } from './claude-history.js';
@@ -70,6 +70,31 @@ export function classifyRateLimitEvent(
 
 export { SDK_DISALLOWED_TOOLS, TOOL_ALLOWLIST } from './claude-config.js';
 
+/**
+ * The resolved inference and execution policy this provider consumes. Claude's
+ * own resolves (claude-config.ts) fill the required fields. The optional SDK
+ * pass-throughs (`settings` beyond fast mode, `thinking`, `tools`) exist for a
+ * contract that wraps those resolves to drive the same SDK against another
+ * backend, such as a local-model provider that turns reasoning off and drops
+ * the Anthropic server tools. Left undefined, the SDK options are exactly what
+ * they always were.
+ */
+export interface ClaudeInference {
+  model?: string;
+  effort?: string;
+  settings?: Options['settings'];
+  thinking?: Options['thinking'];
+}
+
+export interface ClaudeExecutionPolicy {
+  permissionMode: PermissionMode;
+  allowDangerouslySkipPermissions: boolean;
+  /** Built-ins the SDK must refuse; also enforced by the PreToolUse hook. */
+  disallowedTools: readonly string[];
+  /** Built-in tool set handed to the SDK; undefined keeps the SDK default. */
+  tools?: Options['tools'];
+}
+
 interface SDKUserMessage {
   type: 'user';
   message: { role: 'user'; content: string };
@@ -117,29 +142,33 @@ class MessageStream {
 /**
  * PreToolUse hook: record the current tool + its declared timeout so the host
  * sweep can widen its stuck tolerance while Bash is running a long-declared
- * script. Defense-in-depth: if SDK_DISALLOWED_TOOLS slips through somehow,
- * block the call here instead of letting the agent hang.
+ * script. Defense-in-depth: if a disallowed tool slips through somehow, block
+ * the call here instead of letting the agent hang. The list is the resolved
+ * execution policy's, so a contract that extends Claude's disallowed set is
+ * enforced at both doors.
  */
-const preToolUseHook: HookCallback = async (input) => {
-  const i = input as { tool_name?: string; tool_input?: Record<string, unknown> };
-  const toolName = i.tool_name ?? '';
-  if (SDK_DISALLOWED_TOOLS.includes(toolName)) {
-    return {
-      decision: 'block',
-      stopReason: `Tool '${toolName}' is not available in this environment — use the nanoclaw equivalent.`,
-    } as unknown as ReturnType<HookCallback>;
-  }
-  // Bash exposes its timeout via the tool_input.timeout field (ms). Any other
-  // tool: no declared timeout.
-  const declaredTimeoutMs =
-    toolName === 'Bash' && typeof i.tool_input?.timeout === 'number' ? (i.tool_input.timeout as number) : null;
-  try {
-    setContainerToolInFlight(toolName, declaredTimeoutMs);
-  } catch (err) {
-    log(`PreToolUse: failed to record container_state: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  return { continue: true };
-};
+function createPreToolUseHook(disallowedTools: readonly string[]): HookCallback {
+  return async (input) => {
+    const i = input as { tool_name?: string; tool_input?: Record<string, unknown> };
+    const toolName = i.tool_name ?? '';
+    if (disallowedTools.includes(toolName)) {
+      return {
+        decision: 'block',
+        stopReason: `Tool '${toolName}' is not available in this environment — use the nanoclaw equivalent.`,
+      } as unknown as ReturnType<HookCallback>;
+    }
+    // Bash exposes its timeout via the tool_input.timeout field (ms). Any other
+    // tool: no declared timeout.
+    const declaredTimeoutMs =
+      toolName === 'Bash' && typeof i.tool_input?.timeout === 'number' ? (i.tool_input.timeout as number) : null;
+    try {
+      setContainerToolInFlight(toolName, declaredTimeoutMs);
+    } catch (err) {
+      log(`PreToolUse: failed to record container_state: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return { continue: true };
+  };
+}
 
 /** Clear in-flight tool on PostToolUse / PostToolUseFailure. */
 const postToolUseHook: HookCallback = async () => {
@@ -194,8 +223,9 @@ const STALE_SESSION_RE = /no conversation found|ENOENT.*\.jsonl|session.*not fou
 export class ClaudeProvider implements AgentProvider {
   private assistantName?: string;
   private mcp: ReturnType<typeof resolveClaudeMcpServers>;
-  private inference: ReturnType<typeof resolveClaudeInference>;
-  private executionPolicy: ReturnType<typeof resolveClaudeExecutionPolicy>;
+  private inference: ClaudeInference;
+  private executionPolicy: ClaudeExecutionPolicy;
+  private preToolUseHook: HookCallback;
   private env: Record<string, string | undefined>;
   private additionalDirectories?: string[];
   private memorySessionHook?: MemorySessionHookRegistration;
@@ -209,8 +239,9 @@ export class ClaudeProvider implements AgentProvider {
     this.assistantName = options.assistantName;
     this.mcp = configuration.mcpServers as ReturnType<typeof resolveClaudeMcpServers>;
     this.additionalDirectories = options.additionalDirectories;
-    this.inference = configuration.inference as ReturnType<typeof resolveClaudeInference>;
-    this.executionPolicy = configuration.executionPolicy as ReturnType<typeof resolveClaudeExecutionPolicy>;
+    this.inference = configuration.inference as ClaudeInference;
+    this.executionPolicy = configuration.executionPolicy as ClaudeExecutionPolicy;
+    this.preToolUseHook = createPreToolUseHook(this.executionPolicy.disallowedTools);
     this.env = {
       ...(options.env ?? {}),
       CLAUDE_CODE_AUTO_COMPACT_WINDOW,
@@ -273,9 +304,11 @@ export class ClaudeProvider implements AgentProvider {
         // exactly the options it always did. `fastMode` is a Settings member
         // rather than a query option, which is why it rides `settings`.
         ...(this.inference.settings ? { settings: this.inference.settings } : {}),
+        ...(this.inference.thinking !== undefined ? { thinking: this.inference.thinking } : {}),
+        ...(this.executionPolicy.tools !== undefined ? { tools: this.executionPolicy.tools } : {}),
         mcpServers: this.mcp.mcpServers,
         hooks: {
-          PreToolUse: [{ hooks: [preToolUseHook] }],
+          PreToolUse: [{ hooks: [this.preToolUseHook] }],
           PostToolUse: [{ hooks: [postToolUseHook] }],
           PostToolUseFailure: [{ hooks: [postToolUseHook] }],
           PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
