@@ -110,6 +110,14 @@
           </div>
         </header>
 
+        <div id="message-notice" class="message-notice" role="status" hidden>
+          <span id="message-notice-text"></span>
+          <button id="open-message-notice" class="secondary-button" type="button">Open conversation</button>
+          <button id="dismiss-message-notice" class="icon-button" type="button" aria-label="Dismiss new-message notice">
+            ×
+          </button>
+        </div>
+
         <div class="log-wrap">
           <section id="messages" role="log" aria-live="polite" aria-label="Conversation"></section>
           <div id="activity" class="activity" role="status" hidden>

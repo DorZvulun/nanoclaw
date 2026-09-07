@@ -29,6 +29,7 @@ export interface LocalWebConversation {
   model?: string;
   effort?: string;
   isLegacy: boolean;
+  unreadCount?: number;
 }
 
 export interface LocalWebCatalog {
@@ -199,7 +200,7 @@ const CONVERSATION_SELECT = `
     LEFT JOIN container_configs cc ON cc.agent_group_id = ag.id
    WHERE mg.channel_type = ? AND mg.instance = ?`;
 
-export async function listLocalWebCatalog(): Promise<LocalWebCatalog> {
+export async function listLocalWebCatalog(unreadCounts?: ReadonlyMap<string, number>): Promise<LocalWebCatalog> {
   const rows = await getDb().all<ConversationRow>(
     `${CONVERSATION_SELECT}
      ORDER BY lower(ag.name) ASC, ag.id ASC`,
@@ -209,7 +210,10 @@ export async function listLocalWebCatalog(): Promise<LocalWebCatalog> {
   const providers = installedProviders();
   const installationDefault = DEFAULT_AGENT_PROVIDER.toLowerCase();
   return {
-    conversations: rows.map(toConversation),
+    conversations: rows.map((row) => ({
+      ...toConversation(row),
+      ...(unreadCounts && { unreadCount: unreadCounts.get(row.platform_id) ?? 0 }),
+    })),
     installedProviders: providers,
     installationDefault,
     isInstallationDefaultInstalled: providers.includes(installationDefault),

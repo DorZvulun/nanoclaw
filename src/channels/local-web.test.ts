@@ -124,6 +124,42 @@ afterEach(async () => {
 });
 
 describe('local web adapter', () => {
+  it('exposes queued reply counts across catalog refreshes and clears them when the conversation opens', async () => {
+    const { registry, inbound, url, auth } = await startAdapter();
+    const abort = new AbortController();
+    try {
+      const { createLocalWebAgent, localWebPlatformIdForConversation } = await import('./local-web-conversations.js');
+      const created = await createLocalWebAgent({ name: 'Researcher' });
+      if (!created.ok) throw new Error(created.message);
+      const conversationId = created.conversation.conversationId;
+      const platformId = await localWebPlatformIdForConversation(conversationId);
+      if (!platformId) throw new Error('Missing fixture conversation');
+      const adapter = registry.getChannelAdapter('local-web')!;
+      await adapter.deliver(platformId, null, { kind: 'chat', content: { text: 'The result is ready.' } });
+      await adapter.deliver(platformId, null, { kind: 'chat', content: { text: 'One more detail.' } });
+      const readCount = async () => {
+        const response = await fetch(`${url}/api/conversations`, { headers: auth });
+        const body = (await response.json()) as {
+          conversations: Array<{ conversationId: string; unreadCount: number }>;
+        };
+        return body.conversations.find((item) => item.conversationId === conversationId)?.unreadCount;
+      };
+      expect(await readCount()).toBe(2);
+      expect(await readCount()).toBe(2);
+      const response = await fetch(`${url}/events?conversationId=${conversationId}`, {
+        headers: auth,
+        signal: abort.signal,
+      });
+      const chunk = new TextDecoder().decode((await response.body!.getReader().read()).value);
+      expect(chunk).toContain('The result is ready.');
+      expect(await readCount()).toBe(0);
+      expect(inbound).toHaveLength(0);
+    } finally {
+      abort.abort();
+      await registry.teardownChannelAdapters();
+    }
+  });
+
   it('resolves host-initiated DMs to the live chat id so approval cards reach the browser', async () => {
     const { registry } = await startAdapter();
     try {

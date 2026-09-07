@@ -57,7 +57,15 @@ async function responseJson(response) {
   return body;
 }
 
-export function createConversationController({ token, tokenHeader, onCatalog, onSelected, onEvent, onConnection }) {
+export function createConversationController({
+  token,
+  tokenHeader,
+  onCatalog,
+  onSelected,
+  onEvent,
+  onConnection,
+  onNewMessage,
+}) {
   let catalog = null;
   let selected = null;
   let streamAbort = null;
@@ -88,8 +96,23 @@ export function createConversationController({ token, tokenHeader, onCatalog, on
 
   async function loadCatalog() {
     const response = await fetch('/api/conversations', { headers: headers() });
-    catalog = parseCatalog(await responseJson(response));
-    onCatalog(catalog);
+    const next = parseCatalog(await responseJson(response));
+    const previous = catalog;
+    const changed = JSON.stringify(next) !== JSON.stringify(catalog);
+    catalog = next;
+    if (changed) onCatalog(catalog);
+    if (previous) {
+      for (const conversation of next.conversations) {
+        const before = previous.conversations.find((item) => item.conversationId === conversation.conversationId);
+        if (
+          conversation.conversationId !== selected?.conversationId &&
+          Number.isSafeInteger(conversation.unreadCount) &&
+          conversation.unreadCount > (before?.unreadCount ?? 0)
+        ) {
+          onNewMessage?.(conversation);
+        }
+      }
+    }
     return catalog;
   }
 

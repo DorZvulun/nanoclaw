@@ -64,11 +64,16 @@ import { createConversationController } from './local-web-conversation-ui.js';
   const submitDeleteAgent = document.querySelector('#submit-delete-agent');
   const deleteError = document.querySelector('#delete-agent-error');
   const deleteAgentName = document.querySelector('#delete-agent-name');
+  const messageNotice = document.querySelector('#message-notice');
+  const messageNoticeText = document.querySelector('#message-notice-text');
+  const openMessageNotice = document.querySelector('#open-message-notice');
+  const dismissMessageNotice = document.querySelector('#dismiss-message-notice');
   const mobileSidebar = window.matchMedia('(max-width: 780px)');
   let activityTimer = null;
   let conversationController = null;
   let providerWasChanged = false;
   let pendingDeleteConversation = null;
+  let notifiedConversationId = null;
 
   // ---- theme ------------------------------------------------------------
   // No stored choice means follow the OS; the button writes an explicit one.
@@ -528,6 +533,19 @@ import { createConversationController } from './local-web-conversation-ui.js';
   });
 
   function renderCatalog(catalog) {
+    if (
+      notifiedConversationId &&
+      !catalog.conversations.some((item) => item.conversationId === notifiedConversationId && item.unreadCount > 0)
+    ) {
+      messageNotice.hidden = true;
+      notifiedConversationId = null;
+    }
+    const focusedRow = document.activeElement?.closest('.agent-row');
+    const focusedConversationId =
+      focusedRow && agentList.contains(focusedRow) ? focusedRow.dataset.conversationId : null;
+    const focusedControl = document.activeElement?.classList.contains('agent-row-delete')
+      ? '.agent-row-delete'
+      : '.agent-row-select';
     agentList.replaceChildren();
     for (const conversation of catalog.conversations) {
       const row = document.createElement('div');
@@ -563,6 +581,17 @@ import { createConversationController } from './local-web-conversation-ui.js';
       state.className = 'agent-row-state';
       state.setAttribute('aria-hidden', 'true');
       button.append(state);
+      const unread =
+        conversation.conversationId !== conversationController?.selected?.conversationId
+          ? (conversation.unreadCount ?? 0)
+          : 0;
+      if (unread > 0) {
+        state.className = 'agent-unread';
+        state.textContent = unread > 99 ? '99+' : String(unread);
+        state.removeAttribute('aria-hidden');
+        state.setAttribute('aria-label', `${unread} unread messages`);
+        button.setAttribute('aria-label', `Open ${conversation.agentName}, ${unread} unread messages`);
+      }
       button.addEventListener('click', async () => {
         try {
           await conversationController.select(conversation.conversationId);
@@ -584,9 +613,17 @@ import { createConversationController } from './local-web-conversation-ui.js';
       row.append(button, remove);
       agentList.append(row);
     }
+    if (focusedConversationId) {
+      const row = [...agentList.children].find((item) => item.dataset.conversationId === focusedConversationId);
+      (row?.querySelector(focusedControl) ?? createAgentButton).focus({ preventScroll: true });
+    }
   }
 
   function selectConversation(conversation, items) {
+    if (conversation?.conversationId === notifiedConversationId || !conversation) {
+      messageNotice.hidden = true;
+      notifiedConversationId = null;
+    }
     if (!conversation) {
       agentTitle.textContent = 'No agents';
       agentRuntime.textContent = 'Create an agent to start';
@@ -718,6 +755,19 @@ import { createConversationController } from './local-web-conversation-ui.js';
   cancelCreateAgent.addEventListener('click', closeCreateDialog);
   closeDeleteAgent.addEventListener('click', closeDeleteDialog);
   cancelDeleteAgent.addEventListener('click', closeDeleteDialog);
+  dismissMessageNotice.addEventListener('click', () => {
+    messageNotice.hidden = true;
+  });
+  openMessageNotice.addEventListener('click', async () => {
+    if (!notifiedConversationId) return;
+    try {
+      await conversationController.select(notifiedConversationId);
+      setSidebarOpen(false);
+      input.focus();
+    } catch (error) {
+      messageNoticeText.textContent = error instanceof Error ? error.message : 'Conversation could not be opened.';
+    }
+  });
   createForm.addEventListener('submit', async (event) => {
     event.preventDefault();
     showCreateError('');
@@ -822,6 +872,11 @@ import { createConversationController } from './local-web-conversation-ui.js';
       onSelected: selectConversation,
       onEvent: handleEvent,
       onConnection: handleConnection,
+      onNewMessage: (conversation) => {
+        notifiedConversationId = conversation.conversationId;
+        messageNoticeText.textContent = `${conversation.agentName} sent a new message.`;
+        messageNotice.hidden = false;
+      },
     });
     try {
       await conversationController.initialize();

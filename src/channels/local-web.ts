@@ -359,7 +359,13 @@ function createAdapter(): ChannelAdapter {
         return;
       }
       await ensureLocalWebConversations();
-      sendJson(res, 200, await listLocalWebCatalog());
+      const unreadCounts = new Map(
+        [...pendingEvents].map(([platformId, events]) => [
+          platformId,
+          events.filter((event) => event.type === 'reply' || event.type === 'question').length,
+        ]),
+      );
+      sendJson(res, 200, await listLocalWebCatalog(unreadCounts));
       return;
     }
     if (req.method === 'GET' && pathname === '/events') {

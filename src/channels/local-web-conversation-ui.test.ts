@@ -45,6 +45,73 @@ afterEach(() => {
 });
 
 describe('local web conversation controller', () => {
+  it('notifies once when another conversation gains unread messages without switching chats', async () => {
+    const main = { conversationId: 'mg-main', agentName: 'Main', provider: 'ollama', isLegacy: true, unreadCount: 0 };
+    let unreadCount = 0;
+    vi.stubGlobal('fetch', (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input) === '/api/conversations')
+        return Promise.resolve(
+          catalog(main, { conversationId: 'mg-child', agentName: 'Child', provider: 'ollama', unreadCount }),
+        );
+      return eventStream(init?.signal ?? undefined);
+    });
+    const onNewMessage = vi.fn();
+    const module = await loadControllerModule();
+    const controller = module.createConversationController({
+      token: 'test-token',
+      tokenHeader: 'x-test-token',
+      onCatalog: vi.fn(),
+      onSelected: vi.fn(),
+      onEvent: vi.fn(),
+      onConnection: vi.fn(),
+      onNewMessage,
+    });
+    try {
+      await controller.initialize();
+      unreadCount = 1;
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(onNewMessage).toHaveBeenCalledTimes(1);
+      expect(onNewMessage).toHaveBeenLastCalledWith(
+        expect.objectContaining({ conversationId: 'mg-child', unreadCount: 1 }),
+      );
+      expect(controller.selected.conversationId).toBe('mg-main');
+      unreadCount = 2;
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(onNewMessage).toHaveBeenCalledTimes(2);
+      await controller.select('mg-child');
+      unreadCount = 3;
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(onNewMessage).toHaveBeenCalledTimes(2);
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  it('keeps the current view intact when a catalog refresh changes nothing', async () => {
+    const main = { conversationId: 'mg-main', agentName: 'Main', provider: 'ollama', isLegacy: true };
+    vi.stubGlobal('fetch', (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input) === '/api/conversations') return Promise.resolve(catalog(main));
+      return eventStream(init?.signal ?? undefined);
+    });
+    const onCatalog = vi.fn();
+    const module = await loadControllerModule();
+    const controller = module.createConversationController({
+      token: 'test-token',
+      tokenHeader: 'x-test-token',
+      onCatalog,
+      onSelected: vi.fn(),
+      onEvent: vi.fn(),
+      onConnection: vi.fn(),
+    });
+    try {
+      await controller.initialize();
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(onCatalog).toHaveBeenCalledTimes(1);
+    } finally {
+      controller.dispose();
+    }
+  });
+
   it('adds an agent created outside the browser on the next visible catalog refresh', async () => {
     const main = { conversationId: 'mg-main', agentName: 'Main', provider: 'ollama', isLegacy: true };
     const child = { conversationId: 'mg-child', agentName: 'Child', provider: 'ollama', isLegacy: false };
