@@ -7,16 +7,21 @@ rm -f \
   src/providers/ollama.ts \
   src/providers/ollama.test.ts \
   src/providers/ollama-registration.test.ts \
+  src/provider-contracts/ollama.ts \
   container/agent-runner/src/providers/ollama.ts \
   container/agent-runner/src/providers/ollama.test.ts \
   container/agent-runner/src/providers/ollama-registration.test.ts \
   container/agent-runner/src/providers/ollama-tool-policy.test.ts \
+  container/agent-runner/src/providers/ollama.conformance.test.ts \
+  container/agent-runner/src/provider-contracts/ollama.ts \
   container/agent-runner/src/mcp-tools/ollama-web.ts \
   container/agent-runner/src/mcp-tools/ollama-web.test.ts
 ```
 
-Delete `import './ollama.js';` from both `src/providers/index.ts` and
-`container/agent-runner/src/providers/index.ts`, and delete
+Delete `import './ollama.js';` from `src/providers/index.ts`,
+`src/provider-contracts/index.ts`,
+`container/agent-runner/src/providers/index.ts` and
+`container/agent-runner/src/provider-contracts/index.ts`, and delete
 `import './ollama-web.js';` from
 `container/agent-runner/src/mcp-tools/index.ts`, then run:
 

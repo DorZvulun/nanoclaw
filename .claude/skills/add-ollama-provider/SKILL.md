@@ -1,41 +1,62 @@
 ---
 name: add-ollama-provider
 description: Route NanoClaw agent groups through a local Ollama daemon using the Claude Agent SDK and Ollama's Anthropic-compatible API. Use for local models, offline inference, or the `ollama launch nanoclaw` setup.
+metadata:
+  nanoclaw-provider: ollama
+  nanoclaw-provider-label: Ollama
+  nanoclaw-provider-hint: Local models through the Ollama daemon
+  nanoclaw-provider-offered: 'false'
+  nanoclaw-provider-image: hardened-compatible
 ---
 
 # Add Ollama provider
 
 Install an `ollama` provider that reuses NanoClaw's Claude runtime while routing
-requests to the local Ollama daemon. The provider is selectable per agent group;
-other groups keep their existing provider.
+requests to the local Ollama daemon. Selectable per agent group; other groups
+keep their provider. It stays out of the setup picker: `/setup-ollama-launch`
+installs it.
 
 ## Apply
 
-### 1. Copy the provider payload and integration tests
+### 1. Copy the payload
 
-Fetch the `providers` branch and copy the Ollama host and container providers
-with their registration and tool-policy tests. The registry branch is the
-canonical source, so re-applying the skill overwrites these files.
+Fetch the `providers` branch and copy the host and container halves: the two
+provider modules, their host and runtime contracts, the direct web tools, and
+their tests. The registry branch is canonical, so re-applying overwrites these.
 
 ```nc:copy from-branch:providers
 src/providers/ollama.ts
 src/providers/ollama.test.ts
 src/providers/ollama-registration.test.ts
+src/provider-contracts/ollama.ts
 container/agent-runner/src/providers/ollama.ts
 container/agent-runner/src/providers/ollama.test.ts
 container/agent-runner/src/providers/ollama-registration.test.ts
 container/agent-runner/src/providers/ollama-tool-policy.test.ts
+container/agent-runner/src/providers/ollama.conformance.test.ts
+container/agent-runner/src/provider-contracts/ollama.ts
 container/agent-runner/src/mcp-tools/ollama-web.ts
 container/agent-runner/src/mcp-tools/ollama-web.test.ts
 ```
 
-### 2. Register both provider halves
+### 2. Wire the barrels
+
+Provider registration and contract registration are separate imports, so each
+tree takes its own line (skipped if already present).
 
 ```nc:append to:src/providers/index.ts
 import './ollama.js';
 ```
 
+```nc:append to:src/provider-contracts/index.ts
+import './ollama.js';
+```
+
 ```nc:append to:container/agent-runner/src/providers/index.ts
+import './ollama.js';
+```
+
+```nc:append to:container/agent-runner/src/provider-contracts/index.ts
 import './ollama.js';
 ```
 
@@ -51,57 +72,48 @@ pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 ```
 
 ```nc:run effect:test
-pnpm exec vitest run src/providers/ollama-registration.test.ts src/providers/ollama.test.ts src/container-runner.test.ts
+pnpm exec vitest run src/providers/ollama.test.ts src/providers/ollama-registration.test.ts src/container-runner.test.ts
 ```
 
 ```nc:run effect:test
-cd container/agent-runner && bun test src/providers/ollama.test.ts src/providers/ollama-registration.test.ts src/providers/ollama-tool-policy.test.ts src/mcp-tools/ollama-web.test.ts
+cd container/agent-runner && bun test src/providers/ollama.test.ts src/providers/ollama-registration.test.ts src/providers/ollama-tool-policy.test.ts src/providers/ollama.conformance.test.ts src/mcp-tools/ollama-web.test.ts
 ```
 
 ## Configure an agent group
 
-The default endpoint is `http://host.docker.internal:11434`. To use another
-host-visible Ollama endpoint, convert loopback to a container-reachable address
-and persist it before restarting NanoClaw:
+The default endpoint is `http://host.docker.internal:11434`. For another
+host-visible endpoint, convert loopback to a container-reachable address and
+persist it before restarting NanoClaw:
 
 ```bash
 pnpm exec tsx setup/index.ts --step set-env -- --key OLLAMA_BASE_URL --value http://host.docker.internal:11434
 ```
 
-Set the provider and exact model name, then restart the group:
+Then set the provider and the exact model name and restart the group:
 
 ```bash
 ncl groups config update --id <agent-group-id> --provider ollama --model <model>
 ncl groups restart --id <agent-group-id>
 ```
 
-The provider sends a placeholder token directly to Ollama, blocks Anthropic and
-Claude service hosts, and disables Claude Code's cloud-only integrations and
-background traffic. Web browsing defaults to disabled. When
-`OLLAMA_WEB_BROWSING=enabled`, two small MCP tools call the local daemon's signed
-Ollama Web Search and Web Fetch endpoints directly. This avoids the slower
-model-orchestrated server-tool path: Anthropic's built-in server tools stay
-disabled. NanoClaw does not receive or store an Ollama API key. The local
-`agent-browser` remains available for interactive browser work. Nothing else
-needs editing: no group
-`container.json`, Claude settings file, proxy, or API key.
+Nothing else needs editing: no group `container.json`, Claude settings file,
+proxy, or API key. The provider sends a placeholder token to the daemon, blocks
+the Anthropic and Claude service hosts, turns reasoning off when the group sets
+no effort, and disables Claude Code's cloud-only integrations and background
+traffic.
 
-When browsing is enabled, the Ollama provider names the two direct MCP tools in
-its system instructions: search for finding URLs, fetch for reading a supplied
-URL or selected result. It reserves `agent-browser` for clicks, forms, sign-in
-state, screenshots, and visual inspection. This keeps local models on the fast
-daemon path without lowering their reasoning effort.
+Web browsing is off by default. With `OLLAMA_WEB_BROWSING=enabled`, two MCP
+tools call the daemon's signed Ollama Web Search and Web Fetch endpoints
+directly instead of the slower model-orchestrated server-tool path, which stays
+disabled; NanoClaw never receives an Ollama API key. The provider tells the
+agent to use search for finding URLs, fetch for reading one, and to reserve
+`agent-browser` for clicks, forms, sign-in state, and screenshots.
 
-The same provider instructions make `approval-pending` a hard wait point: the
-agent acknowledges the pending request, ends that turn, and resumes only when
-the host delivers the real approval result.
-
-Persistent-agent creation and messaging use NanoClaw's normal provider-neutral
-flow. Ollama does not force the turn to end after either action, so a parent can
-create and brief an agent in one turn and a receiving child can complete the
-work normally. The provider also states the runtime boundary explicitly: an
-acknowledgment does not start a background job, so a receiving agent must do the
-work before ending its turn.
+The provider instructions also make `approval-pending` a hard wait point (the
+agent acknowledges, ends the turn, and resumes on the real result) and state
+that an acknowledgment starts no background job, so a receiving agent finishes
+the work before ending its turn. Agent creation and messaging stay
+provider-neutral and never force the turn to end.
 
 Behavior details, including the `WebFetch` preflight skip and the
 runaway-generation caps: `docs/ollama.md`.
