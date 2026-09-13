@@ -1508,6 +1508,9 @@ async function askAgentProviderChoice(): Promise<string> {
       hint: note(prov.value, `${prov.hint} — installs now`),
     })),
   ];
+  // Only an explicit preset skips the picker (packaged flows). Every
+  // interactive install — fresh or re-run — is asked, so a non-Claude runtime
+  // is discoverable rather than something only a re-run with env vars reaches.
   const preset = process.env.NANOCLAW_AGENT_PROVIDER?.trim().toLowerCase();
   if (preset) {
     if (!options.some((option) => option.value === preset)) {
