@@ -8,7 +8,7 @@ import { registerChannelAdapter } from './channel-registry.js';
 
 export const MATTERMOST_DEFAULTS: ChannelDefaults = {
   dm: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'request_approval' },
-  group: { engageMode: 'mention-sticky', threads: true, unknownSenderPolicy: 'request_approval' },
+  group: { engageMode: 'mention', threads: true, unknownSenderPolicy: 'request_approval' },
   mentions: 'platform',
 };
 

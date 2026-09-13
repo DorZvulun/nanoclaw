@@ -823,11 +823,10 @@ export class MattermostAdapter implements Adapter<MattermostThreadId, Mattermost
     // former. Failure is tolerated — the handle is still a fine name.
     await this.ensureUserResolved(post.user_id);
 
-    const threadId = threadIdForPost(post);
+    const isMention = isExplicitMention(event.data, this.botUserId);
+    const threadId = threadIdForPost(post, isMention);
     const message = this.toMessage(post, threadId);
-    // Mattermost puts the other participant in `data.mentions` on every DM
-    // post, so only non-DM channels can report an explicit @-mention.
-    message.isMention = isExplicitMention(event.data, this.botUserId);
+    message.isMention = isMention;
 
     void chat.processMessage(this, threadId, message);
   }
@@ -1436,15 +1435,18 @@ export class MattermostAdapter implements Adapter<MattermostThreadId, Mattermost
 }
 
 /**
- * Thread id a post belongs to: the channel for a top-level post, the root
- * post's thread for a reply. A top-level post does **not** open a thread of
- * its own — that would make every channel message its own conversation and
- * leave the agent with no context between two consecutive posts.
+ * Thread id a post belongs to: an existing root for a reply, the post itself
+ * for a top-level mention, or the channel for ordinary top-level chatter.
+ *
+ * Rooting only addressed posts gives the bot a concrete reply target without
+ * turning every channel message into a separate conversation. The host can
+ * still collapse this id when a wiring disables threads.
  */
-function threadIdForPost(post: MattermostPost): string {
+function threadIdForPost(post: MattermostPost, rootTopLevelMention = false): string {
+  const rootId = post.root_id || (rootTopLevelMention ? post.id : undefined);
   return encodeThreadId({
     channelId: post.channel_id,
-    rootId: post.root_id || undefined,
+    ...(rootId ? { rootId } : {}),
   });
 }
 

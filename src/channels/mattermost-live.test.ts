@@ -12,8 +12,9 @@
  * What it proves, end to end and with no mocks below the HTTP/WS boundary:
  *   1. adapter + bridge initialize (REST auth resolves the bot, WS connects)
  *   2. a channel message that @-mentions the bot reaches `onInbound` with the
- *      right platform id, thread id, text and mention flag
- *   3. a reply pushed through `bridge.deliver` exists in Mattermost
+ *      right platform id, mention-rooted thread id, text and mention flag
+ *   3. a reply pushed through `bridge.deliver` exists in that Mattermost
+ *      thread
  *   4. the same round trip inside a DM
  *   5. (P1) an ask_question card renders as real message-attachment actions,
  *      and a server-mediated click on one reaches `onAction` and drives the
@@ -274,6 +275,8 @@ let adapter: any;
 let dmChannelId = '';
 let webhookPort = 0;
 const stamp = Date.now();
+let channelMentionRootId = '';
+let channelMentionThreadId = '';
 
 describe.skipIf(!HAS_LAB)('mattermost live round trip', () => {
   beforeAll(async () => {
@@ -332,7 +335,7 @@ describe.skipIf(!HAS_LAB)('mattermost live round trip', () => {
     expect(bridge.name).toBe('mattermost');
   });
 
-  it('b. a channel @mention reaches onInbound with the right ids, text and mention flag', async () => {
+  it('b. a channel @mention opens a thread rooted at the mentioned post', async () => {
     const marker = `p0-channel-in-${stamp}`;
     const sent = await asUser<Post>('POST', '/posts', {
       channel_id: CHANNEL_ID,
@@ -340,12 +343,10 @@ describe.skipIf(!HAS_LAB)('mattermost live round trip', () => {
     });
 
     const received = await waitForInbound(marker);
+    channelMentionRootId = sent.id;
+    channelMentionThreadId = tid(CHANNEL_ID, sent.id);
     expect(received.platformId).toBe(tid(CHANNEL_ID));
-    // A top-level channel post belongs to the channel's thread, not to a
-    // thread of its own: with group defaults threads:true, rooting every
-    // message on itself would give the agent no context between two
-    // consecutive posts in a channel.
-    expect(received.threadId).toBe(tid(CHANNEL_ID));
+    expect(received.threadId).toBe(channelMentionThreadId);
     expect(received.message.id).toBe(sent.id);
     expect(received.message.kind).toBe('chat-sdk');
     expect(received.message.isMention).toBe(true);
@@ -356,9 +357,9 @@ describe.skipIf(!HAS_LAB)('mattermost live round trip', () => {
     expect(content.sender).toBe(USER_LOGIN);
   }, 60_000);
 
-  it('c. an outbound reply through bridge.deliver lands in the channel', async () => {
+  it('c. an outbound reply through bridge.deliver lands in the mention thread', async () => {
     const marker = `p0-channel-out-${stamp}`;
-    const postId = await bridge.deliver(tid(CHANNEL_ID), tid(CHANNEL_ID), {
+    const postId = await bridge.deliver(tid(CHANNEL_ID), channelMentionThreadId, {
       kind: 'text',
       content: { text: `channel reply ${marker}` },
     });
@@ -366,8 +367,11 @@ describe.skipIf(!HAS_LAB)('mattermost live round trip', () => {
 
     const post = await asBot<Post>(`/posts/${postId}`);
     expect(post.channel_id).toBe(CHANNEL_ID);
+    expect(post.root_id).toBe(channelMentionRootId);
     expect(post.user_id).toBe(BOT_ID);
     expect(post.message).toBe(`channel reply ${marker}`);
+    const thread = await asBot<{ order: string[] }>(`/posts/${channelMentionRootId}/thread`);
+    expect(thread.order).toContain(postId);
   }, 60_000);
 
   it('d. isDM is false for a DM channel the adapter has never observed (cold cache)', () => {
@@ -389,7 +393,8 @@ describe.skipIf(!HAS_LAB)('mattermost live round trip', () => {
     expect(received.threadId).toBe(tid(dmChannelId));
     expect(received.message.id).toBe(sent.id);
     // The DM branch of the bridge: DMs count as addressed to the bot, and are
-    // not group messages — so the host applies DM defaults, not mention-sticky.
+    // not group messages — so the host applies DM defaults, not the group
+    // mention policy.
     // This must hold on a COLD channel (d) proved nothing had primed it): the
     // adapter reads channel_type 'D' off the posted frame and caches it before
     // dispatching, so even the very first DM takes the DM branch.
