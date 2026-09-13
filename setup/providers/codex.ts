@@ -191,24 +191,26 @@ interface CodexCliInvocation {
  * one is actually about npm or the network. Collapsing them sends the operator
  * after the wrong thing.
  */
-type CodexCliFailure =
-  | 'codex_cli_manifest_unreadable'
-  | 'codex_cli_missing'
-  | 'codex_cli_unpinned'
-  | 'codex_cli_bootstrap_failed';
+export type CodexCliFailure =
+  | { reason: 'codex_cli_manifest_unreadable' }
+  | { reason: 'codex_cli_missing' }
+  | { reason: 'codex_cli_unpinned' }
+  | { reason: 'codex_cli_bootstrap_failed'; pinnedVersion: string };
 
-type CodexCliResolution = { ok: true; cli: CodexCliInvocation } | { ok: false; reason: CodexCliFailure };
+type CodexCliResolution = { ok: true; cli: CodexCliInvocation } | { ok: false; failure: CodexCliFailure };
 
-const CODEX_CLI_FAILURE_MESSAGES: Record<CodexCliFailure, string> = {
-  codex_cli_manifest_unreadable:
-    "Couldn't read container/cli-tools.json, so there's no pinned Codex CLI to sign in with. Re-run the /add-codex skill to restore the provider payload, then retry — or choose the API key option instead.",
-  codex_cli_missing:
-    'The Codex provider payload is incomplete: container/cli-tools.json has no @openai/codex entry, so there is no pinned CLI to sign in with. Re-run the /add-codex skill, then retry — or choose the API key option instead.',
-  codex_cli_unpinned:
-    'container/cli-tools.json pins @openai/codex to something other than an exact version, and setup will not fetch an unpinned CLI onto this machine. Re-run the /add-codex skill to restore the exact pin, then retry — or choose the API key option instead.',
-  codex_cli_bootstrap_failed:
-    "Couldn't run the pinned Codex CLI with npx. Check npm and network access, then retry. You can also install it yourself with `npm install -g @openai/codex --prefix ~/.local` (no sudo, no /usr writes) and re-run setup — or choose the API key option instead.",
-};
+export function buildCodexCliFailureMessage(failure: CodexCliFailure): string {
+  switch (failure.reason) {
+    case 'codex_cli_manifest_unreadable':
+      return "Couldn't read container/cli-tools.json, so there's no pinned Codex CLI to sign in with. Re-run the /add-codex skill to restore the provider payload, then retry — or choose the API key option instead.";
+    case 'codex_cli_missing':
+      return 'The Codex provider payload is incomplete: container/cli-tools.json has no @openai/codex entry, so there is no pinned CLI to sign in with. Re-run the /add-codex skill, then retry — or choose the API key option instead.';
+    case 'codex_cli_unpinned':
+      return 'container/cli-tools.json pins @openai/codex to something other than an exact version, and setup will not fetch an unpinned CLI onto this machine. Re-run the /add-codex skill to restore the exact pin, then retry — or choose the API key option instead.';
+    case 'codex_cli_bootstrap_failed':
+      return `Couldn't run the pinned Codex CLI with npx. Check npm and network access, then retry. You can also install it yourself with \`npm install -g @openai/codex@${failure.pinnedVersion} --prefix ~/.local\` (no sudo, no /usr writes) and re-run setup — or choose the API key option instead.`;
+  }
+}
 
 // Exact-version gate. The matching spec is handed to `npx --yes`, which installs
 // and executes on the HOST, so a range or a `latest` here would mean running
@@ -226,10 +228,10 @@ function resolveCodexCli(projectRoot: string): CodexCliResolution {
     const tools = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as Array<{ name?: string; version?: string }>;
     version = tools.find((tool) => tool.name === '@openai/codex')?.version;
   } catch {
-    return { ok: false, reason: 'codex_cli_manifest_unreadable' };
+    return { ok: false, failure: { reason: 'codex_cli_manifest_unreadable' } };
   }
-  if (!version) return { ok: false, reason: 'codex_cli_missing' };
-  if (!EXACT_SEMVER.test(version)) return { ok: false, reason: 'codex_cli_unpinned' };
+  if (!version) return { ok: false, failure: { reason: 'codex_cli_missing' } };
+  if (!EXACT_SEMVER.test(version)) return { ok: false, failure: { reason: 'codex_cli_unpinned' } };
 
   const packageSpec = `@openai/codex@${version}`;
   p.log.step(brandBody(`Preparing the pinned Codex CLI (${version}) for sign-in…`));
@@ -237,7 +239,8 @@ function resolveCodexCli(projectRoot: string): CodexCliResolution {
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  if (npxCheck.status !== 0) return { ok: false, reason: 'codex_cli_bootstrap_failed' };
+  if (npxCheck.status !== 0)
+    return { ok: false, failure: { reason: 'codex_cli_bootstrap_failed', pinnedVersion: version } };
   return { ok: true, cli: { command: 'npx', prefixArgs: ['--yes', packageSpec] } };
 }
 
@@ -249,8 +252,8 @@ export async function runCodexLoginAuth(
 ): Promise<void> {
   const resolved = resolveCodexCli(projectRoot);
   if (!resolved.ok) {
-    p.log.error(brandBody(CODEX_CLI_FAILURE_MESSAGES[resolved.reason]));
-    setupLog.step('auth', 'failed', 0, { PROVIDER: 'codex', METHOD: method, ERROR: resolved.reason });
+    p.log.error(brandBody(buildCodexCliFailureMessage(resolved.failure)));
+    setupLog.step('auth', 'failed', 0, { PROVIDER: 'codex', METHOD: method, ERROR: resolved.failure.reason });
     process.exit(1);
   }
   const cli = resolved.cli;
