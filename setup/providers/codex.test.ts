@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Mock child_process so runCodexLoginAuth never spawns a real codex CLI; the
 // spawn stand-in plays `codex login` writing auth.json into whatever
@@ -21,6 +21,54 @@ vi.mock('child_process', () => ({
 vi.mock('../logs.js', () => ({ step: vi.fn(), userInput: vi.fn() }));
 
 import { buildCodexFailurePrompt, runCodexInstallCheck, runCodexLoginAuth, verifyCodexInstall } from './codex.js';
+import * as setupLog from '../logs.js';
+
+// No global mock reset is configured, so a stubbed spawn/spawnSync would
+// otherwise leak into the next test and let a broken resolver pass on a
+// neighbour's leftovers. Each test below arranges its own doubles.
+beforeEach(() => {
+  vi.resetAllMocks();
+});
+
+/** A project root whose CLI manifest pins @openai/codex to `version`. */
+function manifestRoot(version: string | undefined): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-auth-manifest-'));
+  fs.mkdirSync(path.join(root, 'container'), { recursive: true });
+  const entry =
+    version === undefined ? { name: 'agent-browser', version: '0.27.1' } : { name: '@openai/codex', version };
+  fs.writeFileSync(path.join(root, 'container', 'cli-tools.json'), JSON.stringify([entry]));
+  return root;
+}
+
+/** Runs the auth flow expecting it to bail out via process.exit(1). */
+async function expectAuthExit(run: () => Promise<void>): Promise<void> {
+  const exit = vi.spyOn(process, 'exit').mockImplementation(((): never => {
+    throw new Error('process.exit');
+  }) as never);
+  try {
+    await expect(run()).rejects.toThrow('process.exit');
+  } finally {
+    exit.mockRestore();
+  }
+}
+
+/** The ERROR field of the last failed `auth` step recorded by setupLog. */
+function lastAuthFailureReason(): string | undefined {
+  const calls = vi.mocked(setupLog.step).mock.calls.filter((c) => c[0] === 'auth' && c[1] === 'failed');
+  const fields = calls.at(-1)?.[3] as Record<string, string> | undefined;
+  return fields?.ERROR;
+}
+
+/** spawn stand-in that plays a successful `codex login` into CODEX_HOME. */
+function playSuccessfulLogin(): void {
+  mockSpawn.mockImplementation((...args: unknown[]) => {
+    const opts = args[2] as { env?: NodeJS.ProcessEnv };
+    fs.writeFileSync(path.join(opts.env!.CODEX_HOME!, 'auth.json'), '{"tokens":{}}');
+    const child = new EventEmitter();
+    setImmediate(() => child.emit('close', 0));
+    return child;
+  });
+}
 
 // Structural guard for the codex payload wiring: provider files, both barrel
 // imports, and the pinned Dockerfile install. Goes red if any of them is
@@ -109,24 +157,12 @@ describe('runCodexLoginAuth', () => {
   });
 
   it('runs the manifest-pinned CLI through npx when codex is not installed on the host', async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-auth-bootstrap-'));
-    fs.mkdirSync(path.join(root, 'container'), { recursive: true });
-    fs.writeFileSync(
-      path.join(root, 'container', 'cli-tools.json'),
-      JSON.stringify([{ name: '@openai/codex', version: '0.146.0' }]),
-    );
+    const root = manifestRoot('0.146.0');
     mockSpawnSync
       .mockReturnValueOnce({ status: 1, stdout: '', stderr: 'not found' })
       .mockReturnValueOnce({ status: 0, stdout: 'codex-cli 0.146.0', stderr: '' });
     mockExecFileSync.mockReturnValue('');
-
-    mockSpawn.mockImplementation((...args: unknown[]) => {
-      const opts = args[2] as { env?: NodeJS.ProcessEnv };
-      fs.writeFileSync(path.join(opts.env!.CODEX_HOME!, 'auth.json'), '{"tokens":{}}');
-      const child = new EventEmitter();
-      setImmediate(() => child.emit('close', 0));
-      return child;
-    });
+    playSuccessfulLogin();
 
     try {
       await runCodexLoginAuth('device', root);
@@ -144,6 +180,105 @@ describe('runCodexLoginAuth', () => {
           env: expect.objectContaining({ CODEX_HOME: expect.any(String) }),
         }),
       );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // The production caller (runCodexAuthStep) passes no root, so the default is
+  // the only path a real operator takes — assert it reads the manifest from the
+  // repo root that setup.sh cds into, not some other directory.
+  it('reads the pinned version from process.cwd() when no project root is passed', async () => {
+    const root = manifestRoot('0.146.0');
+    const cwd = vi.spyOn(process, 'cwd').mockReturnValue(root);
+    mockSpawnSync
+      .mockReturnValueOnce({ status: 1, stdout: '', stderr: 'not found' })
+      .mockReturnValueOnce({ status: 0, stdout: 'codex-cli 0.146.0', stderr: '' });
+    mockExecFileSync.mockReturnValue('');
+    playSuccessfulLogin();
+
+    try {
+      await runCodexLoginAuth('device');
+
+      expect(mockSpawn).toHaveBeenCalledWith(
+        'npx',
+        ['--yes', '@openai/codex@0.146.0', 'login', '--device-auth'],
+        expect.objectContaining({ stdio: 'inherit' }),
+      );
+    } finally {
+      cwd.mockRestore();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // Supply-chain gate: the manifest spec is handed to `npx --yes`, which installs
+  // and runs on the HOST. A range or `latest` must fail closed rather than fetch
+  // whatever the registry serves today.
+  it('refuses an unpinned manifest version instead of fetching it', async () => {
+    const root = manifestRoot('^0.146.0');
+    // Everything downstream is armed for success, so the pin gate is the only
+    // thing that can stop this: drop the gate and the flow logs in happily.
+    mockSpawnSync
+      .mockReturnValueOnce({ status: 1, stdout: '', stderr: 'not found' })
+      .mockReturnValueOnce({ status: 0, stdout: 'codex-cli 0.146.0', stderr: '' });
+    mockExecFileSync.mockReturnValue('');
+    playSuccessfulLogin();
+
+    try {
+      await expectAuthExit(() => runCodexLoginAuth('device', root));
+
+      expect(lastAuthFailureReason()).toBe('codex_cli_unpinned');
+      // The npx probe is itself the install — it must not have run at all.
+      expect(mockSpawnSync).toHaveBeenCalledTimes(1);
+      expect(mockSpawnSync).not.toHaveBeenCalledWith('npx', expect.anything(), expect.anything());
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('reports an incomplete payload, not an npm problem, when the manifest has no codex entry', async () => {
+    const root = manifestRoot(undefined);
+    mockSpawnSync
+      .mockReturnValueOnce({ status: 1, stdout: '', stderr: 'not found' })
+      .mockReturnValueOnce({ status: 0, stdout: 'codex-cli 0.146.0', stderr: '' });
+    mockExecFileSync.mockReturnValue('');
+    playSuccessfulLogin();
+
+    try {
+      await expectAuthExit(() => runCodexLoginAuth('device', root));
+
+      expect(lastAuthFailureReason()).toBe('codex_cli_missing');
+      expect(mockSpawnSync).not.toHaveBeenCalledWith('npx', expect.anything(), expect.anything());
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('reports an unreadable manifest distinctly from a failed npx bootstrap', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-auth-nomanifest-'));
+    mockSpawnSync.mockReturnValueOnce({ status: 1, stdout: '', stderr: 'not found' });
+
+    try {
+      await expectAuthExit(() => runCodexLoginAuth('device', root));
+
+      expect(lastAuthFailureReason()).toBe('codex_cli_manifest_unreadable');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('reports a failed npx bootstrap once the pin is valid', async () => {
+    const root = manifestRoot('0.146.0');
+    mockSpawnSync
+      .mockReturnValueOnce({ status: 1, stdout: '', stderr: 'not found' })
+      .mockReturnValueOnce({ status: 1, stdout: '', stderr: 'network unreachable' });
+
+    try {
+      await expectAuthExit(() => runCodexLoginAuth('device', root));
+
+      expect(lastAuthFailureReason()).toBe('codex_cli_bootstrap_failed');
+      // No login was attempted with a CLI that cannot run.
+      expect(mockSpawn).not.toHaveBeenCalled();
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
