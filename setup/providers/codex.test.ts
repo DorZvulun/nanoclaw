@@ -213,7 +213,8 @@ describe('runCodexLoginAuth', () => {
 
   // Supply-chain gate: the manifest spec is handed to `npx --yes`, which installs
   // and runs on the HOST. A range or `latest` must fail closed rather than fetch
-  // whatever the registry serves today.
+  // whatever the registry serves today. It reports as an incomplete payload
+  // because that is the same remedy as a missing entry — re-run /add-codex.
   it('refuses an unpinned manifest version instead of fetching it', async () => {
     const root = manifestRoot('^0.146.0');
     // Everything downstream is armed for success, so the pin gate is the only
@@ -227,7 +228,7 @@ describe('runCodexLoginAuth', () => {
     try {
       await expectAuthExit(() => runCodexLoginAuth('device', root));
 
-      expect(lastAuthFailureReason()).toBe('codex_cli_unpinned');
+      expect(lastAuthFailureReason()).toBe('codex_cli_missing');
       // The npx probe is itself the install — it must not have run at all.
       expect(mockSpawnSync).toHaveBeenCalledTimes(1);
       expect(mockSpawnSync).not.toHaveBeenCalledWith('npx', expect.anything(), expect.anything());
