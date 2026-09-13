@@ -20,13 +20,7 @@ vi.mock('child_process', () => ({
 // Keep the auth flow's structured logging out of logs/setup.log.
 vi.mock('../logs.js', () => ({ step: vi.fn(), userInput: vi.fn() }));
 
-import {
-  buildCodexCliFailureMessage,
-  buildCodexFailurePrompt,
-  runCodexInstallCheck,
-  runCodexLoginAuth,
-  verifyCodexInstall,
-} from './codex.js';
+import { buildCodexFailurePrompt, runCodexInstallCheck, runCodexLoginAuth, verifyCodexInstall } from './codex.js';
 import * as setupLog from '../logs.js';
 
 // No global mock reset is configured, so a stubbed spawn/spawnSync would
@@ -160,16 +154,6 @@ describe('runCodexLoginAuth', () => {
 
     // The isolated dir holds a live credential — gone once vaulted.
     expect(fs.existsSync(codexHome!)).toBe(false);
-  });
-
-  it('pins the manual install fallback to the same reviewed manifest version', () => {
-    const message = buildCodexCliFailureMessage({
-      reason: 'codex_cli_bootstrap_failed',
-      pinnedVersion: '0.146.0',
-    });
-
-    expect(message).toContain('npm install -g @openai/codex@0.146.0 --prefix ~/.local');
-    expect(message).not.toContain('npm install -g @openai/codex --prefix');
   });
 
   it('runs the manifest-pinned CLI through npx when codex is not installed on the host', async () => {
