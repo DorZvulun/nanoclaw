@@ -365,6 +365,14 @@ call and connects to nothing.
 
 ## Troubleshooting
 
+**An iPhone call pauses when the screen locks or you switch apps.** If the call
+was launched as a Home Screen web app, open the same link directly in Safari
+and compare: background calls have worked there while Home Screen mode paused
+until returning to the app. Home Screen background calling is not yet verified.
+On iOS 26, turning off **Open as Web App** when adding the link to the Home
+Screen creates a browser bookmark instead. See
+[WebKit’s Home Screen behavior](https://webkit.org/blog/17333/webkit-features-in-safari-26-0/#every-site-can-be-a-web-app-on-ios-and-ipados).
+
 **A reply fails after hangup.** Voice delivery requires an active call. A reply
 that cannot be spoken is reported as a delivery failure through the host retry
 path. Voice does not deliver files or interactive question cards; ask questions
