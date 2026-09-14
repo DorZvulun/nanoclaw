@@ -33,7 +33,7 @@ describe('mattermost channel registration', () => {
     expect(getRegisteredChannelNames()).toContain('mattermost');
   });
 
-  it('requires an explicit platform mention for every group turn', () => {
-    expect(MATTERMOST_DEFAULTS.group).toMatchObject({ engageMode: 'mention', threads: true });
+  it('activates a group thread on mention and keeps its later replies active', () => {
+    expect(MATTERMOST_DEFAULTS.group).toMatchObject({ engageMode: 'mention-sticky', threads: true });
   });
 });
