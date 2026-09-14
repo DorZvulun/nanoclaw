@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -44,20 +44,11 @@ describe('voice call page (generated)', () => {
   });
 
   it('was generated from the ui/ sources in this tree', () => {
-    // Same walk as .claude/skills/add-voice/ui/scripts/emit-page.mjs: sorted names, node_modules and dist skipped.
     const here = path.dirname(fileURLToPath(import.meta.url));
     const uiRoot = path.resolve(here, '../../.claude/skills/add-voice/ui');
-    if (!existsSync(uiRoot)) return; // payload installed without the skill sources
-    const files: string[] = [];
-    const walk = (dir: string) => {
-      for (const name of readdirSync(dir).sort()) {
-        if (name === 'node_modules' || name === 'dist' || name === '.gitignore') continue;
-        const full = path.join(dir, name);
-        if (statSync(full).isDirectory()) walk(full);
-        else files.push(path.relative(uiRoot, full).split(path.sep).join('/'));
-      }
-    };
-    walk(uiRoot);
+    if (!existsSync(path.join(uiRoot, 'source-files.json'))) return; // Installed payloads do not need the maintainer build tree.
+    const inputs = JSON.parse(readFileSync(path.join(uiRoot, 'source-files.json'), 'utf8')) as string[];
+    const files = ['source-files.json', ...inputs].sort();
     const hash = createHash('sha256');
     for (const rel of files) {
       hash.update(rel + '\0');
