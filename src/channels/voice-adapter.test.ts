@@ -242,6 +242,7 @@ describe('gpt-live adapter (fake OpenAI, real webhook server)', () => {
   let adapter: ChannelAdapter;
   let base: string;
   const clock = { now: Date.now() };
+  let accessEnabled = true;
   const inbound: Array<{ platformId: string; threadId: string | null; message: InboundMessage }> = [];
 
   beforeAll(async () => {
@@ -254,10 +255,17 @@ describe('gpt-live adapter (fake OpenAI, real webhook server)', () => {
       publicUrl: `http://127.0.0.1:${webhookPort}`,
       voice: 'marin',
       linkTokens: ['tok123'],
-      fallbackAgentName: 'the assistant',
       apiBase: `http://127.0.0.1:${fake.port}/v1`,
       wsBase: `ws://127.0.0.1:${fake.port}/v1`,
-      resolveAgent: async () => ({ name: 'Andy 🐾', personality: 'Dry humour, precise.' }),
+      resolveLine: async (id) =>
+        accessEnabled
+          ? {
+              caller: { id, name: 'Ethan' },
+              agentGroupId: 'ag-andy',
+              agent: { name: 'Andy 🐾', personality: 'Dry humour, precise.' },
+            }
+          : null,
+      accessCheckIntervalMs: 50,
       now: () => clock.now,
       requestTimeoutMs: 500,
     });
@@ -292,10 +300,23 @@ describe('gpt-live adapter (fake OpenAI, real webhook server)', () => {
     expect(fake.sessionCreates).toHaveLength(0);
   });
 
+  it('rejects an unregistered or revoked caller before exposing a name or creating a session', async () => {
+    accessEnabled = false;
+    try {
+      expect((await fetch(`${base}/info?t=tok123`)).status).toBe(403);
+      expect((await fetch(`${base}/sdp?t=tok123&caller=Ethan`, { method: 'POST', body: 'v=0\r\noffer' })).status).toBe(
+        403,
+      );
+      expect(fake.sessionCreates).toHaveLength(0);
+    } finally {
+      accessEnabled = true;
+    }
+  });
+
   it('tells the page who answers the line, only with a known token', async () => {
     const ok = await fetch(`${base}/info?t=tok123`);
     expect(ok.status).toBe(200);
-    expect(await ok.json()).toEqual({ agent: 'Andy 🐾' });
+    expect(await ok.json()).toEqual({ agent: 'Andy 🐾', caller: 'Ethan' });
     expect((await fetch(`${base}/info?t=nope`)).status).toBe(403);
   });
 
@@ -318,6 +339,7 @@ describe('gpt-live adapter (fake OpenAI, real webhook server)', () => {
     expect(session.delegation).toEqual({ type: 'client' });
     expect(session.instructions).toContain('You are Andy 🐾');
     expect(session.instructions).toContain('Dry humour');
+    expect(session.instructions).toContain(JSON.stringify({ id: LINE, name: 'Ethan' }));
     expect(create.body.transport).toEqual({ type: 'webrtc', sdp: 'v=0\r\noffer' });
 
     expect(fake.attach.path).toBe('/v1/live/sessions/live_fake1/attach');
@@ -347,7 +369,7 @@ describe('gpt-live adapter (fake OpenAI, real webhook server)', () => {
     expect(message.isGroup).toBe(false);
     expect(message.content).toMatchObject({
       text: 'Assistant: Hi, how can I help?\nCaller: What is on my calendar tomorrow?',
-      sender: 'Voice line',
+      sender: 'Ethan',
       senderId: LINE,
       gptLive: { sessionId: 'live_fake1', delegationId: 'item_1', supersedes: null },
     });
@@ -491,6 +513,27 @@ describe('gpt-live adapter (fake OpenAI, real webhook server)', () => {
     expect(next.status).toBe(200);
   });
 
+  it('rechecks access before speaking a pending backend result', async () => {
+    accessEnabled = false;
+    const before = fake.received.filter((e) => e.type === 'session.commentary.append').length;
+    await expect(adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'private result' } })).rejects.toThrow(
+      /access|active call/,
+    );
+    expect(fake.received.filter((e) => e.type === 'session.commentary.append')).toHaveLength(before);
+    accessEnabled = true;
+  });
+
+  it('ends an idle active call when its membership is revoked', async () => {
+    const response = await fetch(`${base}/sdp?t=tok123`, { method: 'POST', body: 'v=0\r\noffer' });
+    const id = response.headers.get('x-voice-session')!;
+    accessEnabled = false;
+    try {
+      await vi.waitFor(() => expect(fake.hangups).toContain(id));
+    } finally {
+      accessEnabled = true;
+    }
+  });
+
   it('refuses an oversized SDP body with 413 before touching OpenAI', async () => {
     const creates = fake.sessionCreates.length;
     const res = await fetch(`${base}/sdp?t=tok123`, {
@@ -547,10 +590,13 @@ describe('voice call limits and pending creation', () => {
       publicUrl: base,
       voice: 'marin',
       linkTokens: ['limited', 'other'],
-      fallbackAgentName: 'Agent',
       apiBase: `http://127.0.0.1:${fake.port}/v1`,
       wsBase: `ws://127.0.0.1:${fake.port}/v1`,
-      resolveAgent: async () => ({ name: 'Agent' }),
+      resolveLine: async (id) => ({
+        caller: { id, name: 'Caller' },
+        agentGroupId: 'ag-test',
+        agent: { name: 'Agent' },
+      }),
       requestTimeoutMs: 500,
       maxCallDurationMs: 300,
       maxCallsPerHour: 2,
@@ -604,6 +650,26 @@ describe('voice call limits and pending creation', () => {
         true,
       ),
     );
+  });
+
+  it('a browser disconnect during attach closes the created session', async () => {
+    fake.nextAttachDelayMs = 150;
+    const abort = new AbortController();
+    const pending = fetch(`${base}/sdp?t=limited`, {
+      method: 'POST',
+      body: 'v=0\r\noffer',
+      signal: abort.signal,
+    }).catch(() => null);
+    await vi.waitFor(() => expect(fake.attaches).toHaveLength(1));
+    abort.abort();
+    await pending;
+    await vi.waitFor(() => expect(fake.hangups).toEqual(['live_fake1']));
+    await expect(
+      adapter.deliver(lineIdForToken('limited'), null, {
+        kind: 'chat',
+        content: { text: 'Must not be spoken' },
+      }),
+    ).rejects.toThrow(/no active call/);
   });
 
   it('a creation completing after teardown is hung up and never attached', async () => {

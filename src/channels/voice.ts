@@ -42,7 +42,13 @@ import { registerChannelAdapter } from './channel-registry.js';
 import { callPageHtml, type VoiceUiConfig } from './gpt-live-call-page.js';
 import { resolveOpenAiKey } from './gpt-live-keychain.js';
 import { attachSideband, type SidebandSocket } from './gpt-live-sideband.js';
-import { resolveWiredAgent, sessionConfig, type VoiceAgent } from './gpt-live-prompt.js';
+import {
+  resolveVoiceLine,
+  sessionConfig,
+  type VoiceAgent,
+  type VoiceCaller,
+  type VoiceLine,
+} from './gpt-live-prompt.js';
 import {
   GptLiveSession,
   type DelegationRequest,
@@ -63,11 +69,11 @@ export const THINK_INTERVAL_MS = 20_000;
  * A voice line is DM-shaped: everything the voice model delegates is for the
  * agent (pattern '.'), there are no threads and no platform mention concept.
  * The link token is the credential — whoever holds the link is the line's
- * user — so the DM context is 'public'. Group context is unused; declared
- * strict so a stray group-shaped row never opens the line.
+ * user. Only a named user with explicit membership may start a call; both
+ * contexts are strict and the skill creates a known-sender wiring.
  */
 const GPT_LIVE_DEFAULTS: ChannelDefaults = {
-  dm: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'public' },
+  dm: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'strict' },
   group: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'strict' },
   mentions: 'dm-only',
 };
@@ -80,14 +86,13 @@ export interface GptLiveConfig {
   voice: string;
   /** Link tokens accepted on the HTTP routes; each is one voice line. */
   linkTokens: string[];
-  /** Name used when no agent is wired to the line yet. */
-  fallbackAgentName: string;
   /** REST base; overridable for tests. */
   apiBase?: string;
   /** WebSocket base; overridable for tests. */
   wsBase?: string;
-  /** Looks up the agent wired to a line; defaults to the central-DB lookup. */
-  resolveAgent?: (platformId: string) => Promise<VoiceAgent | null>;
+  /** Resolves the named caller, single wiring and explicit access. Defaults to the central DB. */
+  resolveLine?: (platformId: string) => Promise<VoiceLine | null>;
+  accessCheckIntervalMs?: number;
   /** Observability tap: every sideband server event, before the state machine sees it. */
   onSidebandEvent?: (sessionId: string, event: LiveServerEvent) => void;
   /** Clock, overridable for tests. */
@@ -135,6 +140,8 @@ export class CallReplacedError extends Error {
 
 interface LiveCall {
   platformId: string;
+  line: VoiceLine;
+  accessTimer?: ReturnType<typeof setInterval>;
   session: GptLiveSession;
   socket: SidebandSocket | null;
   /** When the last thinking note went out (config clock). */
@@ -158,7 +165,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
   const apiBase = (config.apiBase ?? DEFAULT_API_BASE).replace(/\/+$/, '');
   const wsBase = (config.wsBase ?? DEFAULT_WS_BASE).replace(/\/+$/, '');
   const tokens = new Set(config.linkTokens.map((t) => t.trim()).filter(Boolean));
-  const resolveAgent = config.resolveAgent ?? ((platformId: string) => resolveWiredAgent(platformId));
+  const resolveLine = config.resolveLine ?? ((platformId: string) => resolveVoiceLine(platformId));
   const now = config.now ?? (() => Date.now());
   const requestTimeoutMs = config.requestTimeoutMs ?? 15_000;
   const maxCallDurationMs = config.maxCallDurationMs ?? 15 * 60_000;
@@ -189,30 +196,34 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
   const onDelegation = (req: DelegationRequest): void => {
     const call = [...lines.values()].find((c) => c.session.sessionId === req.sessionId);
     if (!call || !setup) return;
-    const message: InboundMessage = {
-      id: `${req.sessionId}:${req.delegationId}`,
-      kind: 'chat',
-      content: {
-        text: req.transcript,
-        sender: 'Voice line',
-        senderId: call.platformId,
-        gptLive: {
-          sessionId: req.sessionId,
-          delegationId: req.delegationId,
-          offsetMs: req.offsetMs,
-          supersedes: req.supersedes,
+    void (async () => {
+      if (!(await checkCallAccess(call)) || !setup) return;
+      const message: InboundMessage = {
+        id: `${req.sessionId}:${req.delegationId}`,
+        kind: 'chat',
+        content: {
+          text: req.transcript,
+          sender: call.line.caller.name,
+          senderId: call.line.caller.id,
+          gptLive: {
+            sessionId: req.sessionId,
+            delegationId: req.delegationId,
+            offsetMs: req.offsetMs,
+            supersedes: req.supersedes,
+          },
         },
-      },
-      timestamp: new Date().toISOString(),
-      isMention: true,
-      isGroup: false,
-    };
-    // Tell the voice model work has started; the reply lands through deliver(). Later typing
-    // ticks are throttled against this note (setTyping below).
-    call.lastThinkAt = now();
-    call.session.think('Working on it.');
-    void Promise.resolve(setup.onInbound(call.platformId, null, message)).catch((err) => {
+        timestamp: new Date().toISOString(),
+        isMention: true,
+        isGroup: false,
+      };
+      // Tell the voice model work has started; the reply lands through deliver(). Later typing
+      // ticks are throttled against this note (setTyping below).
+      call.lastThinkAt = now();
+      call.session.think('Working on it.');
+      await setup.onInbound(call.platformId, null, message);
+    })().catch((err) => {
       log.error('gpt-live: onInbound threw', { platformId: call.platformId, err });
+      closeCall(call, 'inbound routing failed');
     });
   };
 
@@ -234,6 +245,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
     if (call.ended) return;
     call.ended = true;
     clearTimeout(call.expires);
+    clearInterval(call.accessTimer);
     call.attachController.abort();
     if (lines.get(call.platformId) === call) lines.delete(call.platformId);
     const socket = call.socket;
@@ -257,6 +269,22 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
     } finally {
       endCall(call, reason);
     }
+  };
+
+  const sameCallerAndAgent = (a: VoiceLine, b: VoiceLine): boolean =>
+    a.caller.id === b.caller.id && a.caller.name === b.caller.name && a.agentGroupId === b.agentGroupId;
+
+  const checkCallAccess = async (call: LiveCall): Promise<boolean> => {
+    if (call.ended) return false;
+    try {
+      const current = await resolveLine(call.platformId);
+      if (current && sameCallerAndAgent(call.line, current) && lines.get(call.platformId) === call && !call.ended)
+        return true;
+    } catch (err) {
+      log.warn('gpt-live: call access check failed', { platformId: call.platformId, err });
+    }
+    closeCall(call, 'caller access revoked or line changed');
+    return false;
   };
 
   /** Attach the server-side sideband and pump its events into the call's state machine. */
@@ -284,7 +312,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
    * took it meanwhile, this one closes the session it just attached to (so
    * it stops billing) and its request is refused with a CallReplacedError.
    */
-  const openCall = async (token: string, sessionId: string): Promise<LiveCall> => {
+  const openCall = async (token: string, sessionId: string, line: VoiceLine): Promise<LiveCall> => {
     const platformId = lineIdForToken(token);
     const previous = lines.get(platformId);
     if (previous) {
@@ -292,6 +320,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
     }
     const call: LiveCall = {
       platformId,
+      line,
       socket: null,
       session: null as unknown as GptLiveSession,
       lastThinkAt: 0,
@@ -306,6 +335,10 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
     lines.set(platformId, call);
     call.expires = setTimeout(() => closeCall(call, 'duration limit'), maxCallDurationMs);
     call.expires.unref();
+    call.accessTimer = setInterval(() => {
+      void checkCallAccess(call);
+    }, config.accessCheckIntervalMs ?? 5000);
+    call.accessTimer.unref();
     let socket: SidebandSocket;
     try {
       socket = await connectSideband(call);
@@ -329,11 +362,15 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
   const createWebRtcSession = async (
     offer: string,
     agent: VoiceAgent,
+    caller: VoiceCaller,
   ): Promise<{ sessionId: string; answer: string }> => {
     const res = await fetch(`${apiBase}/live/sessions`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${config.apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session: sessionConfig(agent, config.voice), transport: { type: 'webrtc', sdp: offer } }),
+      body: JSON.stringify({
+        session: sessionConfig(agent, config.voice, caller),
+        transport: { type: 'webrtc', sdp: offer },
+      }),
       signal: AbortSignal.timeout(requestTimeoutMs),
     }).catch((err) => {
       throw new UpstreamError(502, 'gpt-live: session creation timed out or could not connect', { cause: err });
@@ -389,8 +426,9 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
         // Who answers this line, so the page can greet by name before the call.
         if (req.method !== 'GET') return reply(res, 405, 'GET only');
         if (!tokens.has(token)) return reply(res, 403, 'Unknown call link');
-        const agent = (await resolveAgent(lineIdForToken(token))) ?? { name: config.fallbackAgentName };
-        return reply(res, 200, JSON.stringify({ agent: agent.name }), {
+        const line = await resolveLine(lineIdForToken(token));
+        if (!line) return reply(res, 403, 'Caller access denied or voice line is not set up');
+        return reply(res, 200, JSON.stringify({ agent: line.agent.name, caller: line.caller.name }), {
           'Content-Type': 'application/json; charset=utf-8',
         });
       }
@@ -402,6 +440,8 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
         const offer = await readBody(req);
         if (!offer.trim().startsWith('v=')) return reply(res, 400, 'Body must be an SDP offer');
         const platformId = lineIdForToken(token);
+        const line = await resolveLine(platformId);
+        if (!line) return reply(res, 403, 'Caller access denied or voice line is not set up');
         const t = now();
         const recent = (starts.get(platformId) ?? []).filter((at) => at > t - 3_600_000);
         if (recent.length >= maxCallsPerHour) {
@@ -415,16 +455,25 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
         let sessionId: string;
         let answer: string;
         try {
-          const agent = (await resolveAgent(platformId)) ?? { name: config.fallbackAgentName };
-          ({ sessionId, answer } = await createWebRtcSession(offer, agent));
-          log.info('gpt-live: session created', { platformId, sessionId, agent: agent.name });
+          ({ sessionId, answer } = await createWebRtcSession(offer, line.agent, line.caller));
+          log.info('gpt-live: session created', { platformId, sessionId, agent: line.agent.name });
           // Creation can finish out of order or after teardown / browser cancellation.
           if (!connected || res.destroyed || pendingStarts.get(platformId) !== attempt) {
             await hangupSession(sessionId);
             if (!res.destroyed) reply(res, 409, 'This call attempt is no longer active');
             return;
           }
-          await openCall(token, sessionId);
+          const current = await resolveLine(platformId);
+          if (!current || !sameCallerAndAgent(line, current)) {
+            await hangupSession(sessionId);
+            return reply(res, 403, 'Caller access changed while connecting');
+          }
+          const call = await openCall(token, sessionId, line);
+          if (res.destroyed) {
+            closeCall(call, 'browser disconnected during attach');
+            await call.cleanup;
+            return;
+          }
         } catch (err) {
           if (err instanceof CallReplacedError) return reply(res, 409, 'A newer call replaced this one');
           throw err;
@@ -512,6 +561,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
       if (message.files?.length) throw new Error('gpt-live: attachments cannot be delivered over a voice call');
       const call = lines.get(platformId);
       if (!call || call.session.isClosed() || !call.socket) throw new Error('gpt-live: no active call on this line');
+      if (!(await checkCallAccess(call))) throw new Error('gpt-live: caller access has been revoked');
       const text = typeof content === 'string' ? content : typeof content?.text === 'string' ? content.text : '';
       if (!text.trim()) throw new Error('gpt-live: reply contains no speakable text');
       const ids = call.session.speak(text);
@@ -523,7 +573,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
       // model needs one quiet note now and then, not a drumbeat: at most one per
       // THINK_INTERVAL_MS while a reply is pending, none once the reply went out.
       const call = lines.get(platformId);
-      if (!call || call.session.pendingDelegations().length === 0) return;
+      if (!call || call.session.pendingDelegations().length === 0 || !(await checkCallAccess(call))) return;
       const t = now();
       if (t - call.lastThinkAt < THINK_INTERVAL_MS) return;
       call.lastThinkAt = t;
@@ -572,7 +622,6 @@ registerChannelAdapter(CHANNEL_TYPE, {
       'GPT_LIVE_PUBLIC_URL',
       'GPT_LIVE_VOICE',
       'GPT_LIVE_LINK_TOKEN',
-      'GPT_LIVE_AGENT_NAME',
       'GPT_LIVE_UI',
       'GPT_LIVE_MAX_CALL_SECONDS',
       'GPT_LIVE_MAX_CALLS_PER_HOUR',
@@ -589,7 +638,6 @@ registerChannelAdapter(CHANNEL_TYPE, {
       publicUrl: (env.GPT_LIVE_PUBLIC_URL || 'http://localhost:3000').replace(/\/+$/, ''),
       voice: env.GPT_LIVE_VOICE || 'marin',
       linkTokens: env.GPT_LIVE_LINK_TOKEN.split(','),
-      fallbackAgentName: env.GPT_LIVE_AGENT_NAME || 'the assistant',
       ui: parseUiConfig(env.GPT_LIVE_UI),
       maxCallDurationMs: Number(env.GPT_LIVE_MAX_CALL_SECONDS ?? 900) * 1000,
       maxCallsPerHour: Number(env.GPT_LIVE_MAX_CALLS_PER_HOUR ?? 12),
