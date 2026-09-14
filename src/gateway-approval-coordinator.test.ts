@@ -694,3 +694,32 @@ it('does not manufacture a human rejection when persisting a durable click fails
     transition.mockRestore();
   }
 });
+
+
+it('preserves approval when terminal notification arrives before the decision response', async () => {
+  const coordinator = await import('./gateway-approval-coordinator.js');
+  const gateway = provider();
+  const native = request();
+  let terminal: ((id: string) => Promise<void>) | undefined;
+  const original = gateway.approvals.subscribe;
+  gateway.approvals.subscribe = (callback, signal, resolved) => {
+    terminal = resolved;
+    return original(callback, signal);
+  };
+  gateway.approvals.durable = true;
+  gateway.approvals.listPending = async () => [];
+  gateway.approvals.decide = vi.fn(async () => {
+    await terminal!(native.id);
+    return true;
+  });
+  await coordinator.startGatewayApprovalCoordinator(gateway, delivery, vi.fn());
+  const outcome = decide(native);
+  await vi.waitFor(() => expect(delivered).toHaveLength(1));
+  const questionId = JSON.parse(delivered[0].content).questionId;
+  await coordinator.handleGatewayApprovalResponse({ questionId, value: 'approve',
+    userId: 'fixture:owner', instance: 'fixture-primary', channelType: 'fixture',
+    platformId: 'owner', threadId: null });
+  expect(await outcome).toBe('approve');
+  expect(JSON.parse(delivered.at(-1)!.content).terminalCard.resolution).toBe('✅ Approved');
+  expect(await getPendingApproval(questionId)).toBeUndefined();
+});

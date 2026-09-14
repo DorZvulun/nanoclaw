@@ -736,10 +736,18 @@ async function deliverDurableDecision(row: PendingApproval): Promise<void> {
 async function resolveGatewayRequest(requestId: string): Promise<void> {
   for (const row of await getPendingApprovalsByAction(GATEWAY_APPROVAL_ACTION)) {
     if (row.request_id !== requestId || JSON.parse(row.payload).gatewayProvider !== selectedKind) continue;
-    await editGatewayApprovalCard(row, 'Request ended at the gateway.');
+    // A gateway terminal event can arrive before its decision HTTP response.
+    // Claim only an undecided row; never overwrite a persisted human decision.
+    await transitionPendingApprovalStatus(row.approval_id, 'pending', 'expired');
+    const current = await getPendingApproval(row.approval_id);
+    if (!current) continue;
+    const decision = current.status === 'approved' ? 'approve'
+      : current.status === 'rejected' ? 'deny' : unavailableDecision();
+    await editGatewayApprovalCard(current, decision === 'approve' ? '✅ Approved'
+      : current.status === 'rejected' ? '❌ Rejected' : 'Request ended at the gateway.');
     await deletePendingApproval(row.approval_id);
     const state = pending.get(row.approval_id);
-    if (state) settle(row.approval_id, state, unavailableDecision());
+    if (state) settle(row.approval_id, state, decision);
   }
 }
 
