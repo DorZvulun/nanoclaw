@@ -8,14 +8,15 @@ import {
 } from './db/messages-in.js';
 import { getUndeliveredMessages, writeMessageOut } from './db/messages-out.js';
 import { clearStaleProcessingAcks } from './db/container-state.js';
+import { resolveDestinationThread } from './db/session-routing.js';
 import { touchHeartbeat } from './heartbeat.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import {
   clearContinuation,
-  clearCurrentInReplyTo,
+  clearCurrentReplyRoute,
   migrateLegacyContinuation,
   setContinuation,
-  setCurrentInReplyTo,
+  setCurrentReplyRoute,
 } from './db/session-state.js';
 import {
   formatMessages,
@@ -116,6 +117,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // Clear leftover 'processing' acks from a previous crashed container.
   // This lets the new container re-process those messages.
   clearStaleProcessingAcks();
+  // Same for the reply stamp a killed container left behind (see session-state.ts).
+  clearCurrentReplyRoute();
 
   let pollCount = 0;
   let isFirstPoll = true;
@@ -243,9 +246,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Process the query while concurrently polling for new messages
     const skippedSet = new Set(skipped.map((s) => s.id));
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
-    // Publish the batch's in_reply_to so MCP tools (send_message, send_file)
-    // can stamp it on outbound rows — needed for a2a return-path routing.
-    setCurrentInReplyTo(routing.inReplyTo);
+    // Publish the batch's route so MCP tools (send_message, send_file) thread
+    // replies into the conversation being answered and stamp in_reply_to for
+    // a2a return-path routing. Re-published at every turn boundary inside
+    // processQuery as later messages are answered.
+    publishReplyRoute(routing);
     // Forward a loop stop to the ACTIVE query. The stream deliberately stays
     // open between turns, so the loop can be parked inside processQuery when
     // config.signal fires; without this, the "stopped" loop's query — and its
@@ -299,7 +304,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // followed by a "Completed" line that reads like success.
       log(`Errored batch will be acked completed — ${processingIds.length} message(s), no redelivery`);
     } finally {
-      clearCurrentInReplyTo();
+      clearCurrentReplyRoute();
       config.signal?.removeEventListener('abort', abortActiveQuery);
     }
 
@@ -371,6 +376,9 @@ export async function processQuery(
    */
   midTurnCompleteDelivery = false,
 ): Promise<QueryResult> {
+  // adoptTurn mutates routing in place; copy so the caller's batch routing
+  // (used for the query error notice) stays the first message's.
+  routing = { ...routing };
   let queryContinuation: string | undefined;
   let done = false;
   let unwrappedNudged = false;
@@ -408,10 +416,37 @@ export async function processQuery(
   // closes anywhere is the wrap-nudge's job, not the buffer's.
   let midTurnTail = '';
   // Prompt queue for the exchange hook — each result event consumes the
-  // oldest unanswered prompt, except a wrapping-retry result, which answers
-  // the same prompt again. Unused (and unmaintained) when the provider
-  // doesn't implement `onExchangeComplete`.
-  const archivePrompts: string[] = [initialPrompt];
+  // oldest unanswered prompt. Retries append the original user prompt at
+  // their position in the provider input queue.
+  const archivePrompts: string[] = initialPrompt ? [initialPrompt] : [];
+  // Where replies go is a property of the TURN, not the query. The query
+  // stays open across turns (below), so a message pushed after the previous
+  // answer finished is a new turn and replies go to ITS thread; a message
+  // pushed while an answer is still streaming waits its turn — the in-flight
+  // answer keeps the destination it started with. Pushed routes queue in
+  // push order (including retries) and advance at every result, mirroring
+  // archivePrompts. An empty initial prompt (a pre-warmed query) starts idle.
+  let answering = initialPrompt !== '';
+  type QueuedTurn = {
+    routing: RoutingContext;
+    unwrappedNudged: boolean;
+    taskBlockNudged: boolean;
+  };
+  const queuedTurns: QueuedTurn[] = [];
+  const adoptTurn = (next: QueuedTurn): void => {
+    Object.assign(routing, next.routing);
+    unwrappedNudged = next.unwrappedNudged;
+    taskBlockNudged = next.taskBlockNudged;
+    publishReplyRoute(routing);
+    answering = true;
+  };
+  // A retry is another provider input, behind any follow-ups already pushed.
+  // Preserve its original route, prompt and retry guards until it is answered.
+  const pushRetry = (prompt: string): void => {
+    query.push(prompt);
+    queuedTurns.push({ routing: { ...routing }, unwrappedNudged, taskBlockNudged });
+    archivePrompts.push(archivePrompts[0] ?? initialPrompt);
+  };
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
   // We do NOT force-end the stream on silence — keeping the query open avoids
@@ -499,10 +534,15 @@ export async function processQuery(
         const keptIds = keep.map((m) => m.id);
         const prompt = formatMessages(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
-        unwrappedNudged = false;
-        taskBlockNudged = false;
         query.push(prompt);
         archivePrompts.push(prompt);
+        const next: QueuedTurn = {
+          routing: extractRouting(keep),
+          unwrappedNudged: false,
+          taskBlockNudged: false,
+        };
+        if (answering) queuedTurns.push(next);
+        else adoptTurn(next);
         markCompleted(keptIds);
       } catch (err) {
         // Without this catch the rejection escapes the void IIFE and Node
@@ -625,7 +665,7 @@ export async function processQuery(
               unwrappedNudged = true;
               const destinations = getAllDestinations();
               const names = destinations.map((d) => d.name).join(', ');
-              query.push(
+              pushRetry(
                 `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
                   `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
                   `Your destinations: ${names}. ` +
@@ -637,12 +677,11 @@ export async function processQuery(
               const names = getAllDestinations()
                 .map((d) => d.name)
                 .join(', ');
-              query.push(buildTaskBlockNudge(taskBlocks, names));
+              pushRetry(buildTaskBlockNudge(taskBlocks, names));
             }
-            // A retry result (wrapping or task-block nudge) answers the SAME
-            // user prompt — keep it queued so the retry archives against it,
-            // not the nudge text.
-            if (!willRetryWrapping && !willRetryTaskBlocks) archivePrompts.shift();
+            // Each result consumes one input; retries carry their original
+            // user prompt at their own position in the FIFO queue.
+            archivePrompts.shift();
           }
         } else archivePrompts.shift();
         // Turn boundary: reset the per-turn sent count after the result's
@@ -657,6 +696,9 @@ export async function processQuery(
         midTurnSent = 0;
         turnStartSeq = maxOutboundSeq();
         midTurnTail = '';
+        const next = queuedTurns.shift();
+        if (next) adoptTurn(next);
+        else answering = false;
       }
     }
   } catch (err) {
@@ -1151,11 +1193,12 @@ export async function autoAppendTaskLog(text: string): Promise<void> {
 async function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): Promise<void> {
   const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
   const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
-  // Resolve thread_id per-destination from the most recent inbound message
-  // that came from this same channel+platform. In agent-shared sessions,
-  // different destinations have different thread contexts — using a single
-  // routing.threadId would stamp one channel's thread onto another.
-  const destRouting = resolveDestinationThread(channelType, platformId);
+  // Thread per destination: the batch's own thread when the destination is the
+  // channel being answered, else that channel's latest inbound thread. In
+  // agent-shared sessions different destinations have different thread
+  // contexts — stamping routing.threadId on every send would put one channel's
+  // thread onto another.
+  const destRouting = resolveDestinationThread(channelType, platformId, routing);
   await writeMessageOut({
     id: generateId(),
     in_reply_to: destRouting?.inReplyTo ?? routing.inReplyTo,
@@ -1167,20 +1210,18 @@ async function sendToDestination(dest: DestinationEntry, body: string, routing: 
   });
 }
 
-/**
- * Find the thread_id and message id from the most recent inbound message
- * matching the given channel+platform. Returns null if no match found.
- */
-function resolveDestinationThread(
-  channelType: string,
-  platformId: string,
-): { threadId: string | null; inReplyTo: string | null } | null {
-  try {
-    return getAgentMailbox().operations.getLatestInboundRoute(channelType, platformId);
-  } catch (err) {
-    log(`resolveDestinationThread error: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  return null;
+/** Publish `routing` as the reply stamp the MCP tools read (null route clears it). */
+function publishReplyRoute(routing: RoutingContext): void {
+  setCurrentReplyRoute(
+    routing.inReplyTo
+      ? {
+          inReplyTo: routing.inReplyTo,
+          channelType: routing.channelType,
+          platformId: routing.platformId,
+          threadId: routing.threadId,
+        }
+      : null,
+  );
 }
 
 function sleep(ms: number): Promise<void> {
