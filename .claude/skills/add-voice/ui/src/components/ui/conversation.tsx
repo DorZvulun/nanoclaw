@@ -1,35 +1,93 @@
 "use client"
 
 import type { ComponentProps } from "react"
-import { useCallback, useEffect, useRef } from "react"
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react"
 import { ArrowDownIcon } from "lucide-react"
-import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom"
 
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 
-export type ConversationProps = ComponentProps<typeof StickToBottom>
+type ConversationState = {
+  viewport: React.RefObject<HTMLDivElement | null>
+  content: React.RefObject<HTMLDivElement | null>
+  isAtBottom: boolean
+  scrollToBottom: () => void
+}
 
-export const Conversation = ({ className, ...props }: ConversationProps) => (
-  <StickToBottom
-    className={cn("relative flex-1 overflow-y-auto", className)}
-    initial="smooth"
-    resize="smooth"
-    role="log"
-    {...props}
-  />
-)
+const ConversationContext = createContext<ConversationState | null>(null)
 
-export type ConversationContentProps = ComponentProps<
-  typeof StickToBottom.Content
->
+function useConversation() {
+  const context = useContext(ConversationContext)
+  if (!context) throw new Error("Conversation components must be inside Conversation")
+  return context
+}
 
-export const ConversationContent = ({
-  className,
-  ...props
-}: ConversationContentProps) => (
-  <StickToBottom.Content className={cn("p-4", className)} {...props} />
-)
+export type ConversationProps = ComponentProps<"div">
+
+export const Conversation = ({ className, children, ...props }: ConversationProps) => {
+  const viewport = useRef<HTMLDivElement>(null)
+  const content = useRef<HTMLDivElement>(null)
+  const following = useRef(true)
+  const lastTop = useRef(0)
+  const [isAtBottom, setIsAtBottom] = useState(true)
+  const scrollToBottom = useCallback(() => {
+    const el = viewport.current
+    if (!el) return
+    following.current = true
+    el.scrollTop = el.scrollHeight
+    lastTop.current = el.scrollTop
+    setIsAtBottom(true)
+  }, [])
+
+  useEffect(() => {
+    const el = viewport.current
+    const body = content.current
+    if (!el || !body) return
+    let frame = 0
+    const onScroll = () => {
+      const atBottom = el.scrollHeight - el.clientHeight - el.scrollTop <= 2
+      // A viewport growing can clamp scrollTop upward while still at the bottom.
+      // Only detach when the reader actually moves away from the newest text.
+      if (atBottom) following.current = true
+      else if (el.scrollTop < lastTop.current) following.current = false
+      lastTop.current = el.scrollTop
+      setIsAtBottom(following.current)
+    }
+    const observer = new ResizeObserver(() => {
+      cancelAnimationFrame(frame)
+      frame = requestAnimationFrame(() => {
+        if (following.current || el.scrollHeight <= el.clientHeight) scrollToBottom()
+      })
+    })
+    observer.observe(body)
+    observer.observe(el)
+    el.addEventListener("scroll", onScroll, { passive: true })
+    return () => {
+      observer.disconnect()
+      cancelAnimationFrame(frame)
+      el.removeEventListener("scroll", onScroll)
+    }
+  }, [scrollToBottom])
+
+  return (
+    <ConversationContext.Provider value={{ viewport, content, isAtBottom, scrollToBottom }}>
+      <div className={cn("relative min-h-0 flex-1 overflow-hidden", className)} role="log" {...props}>
+        {children}
+      </div>
+    </ConversationContext.Provider>
+  )
+}
+
+export type ConversationContentProps = ComponentProps<"div"> & { scrollClassName?: string }
+
+export const ConversationContent = ({ className, scrollClassName, ...props }: ConversationContentProps) => {
+  const { viewport, content } = useConversation()
+  return (
+    <div ref={viewport} className={cn("h-full w-full overflow-y-auto overscroll-contain [overflow-anchor:none]", scrollClassName)} style={{ scrollbarGutter: "stable both-edges" }}>
+      <div ref={content} className={cn("p-4", className)} {...props} />
+    </div>
+  )
+}
 
 export type ConversationEmptyStateProps = Omit<
   ComponentProps<"div">,
@@ -71,32 +129,11 @@ export const ConversationEmptyState = ({
 
 export type ConversationScrollButtonProps = ComponentProps<typeof Button>
 
-/**
- * Pins the view to the newest line. A touch anywhere in the scroller detaches
- * the stick-to-bottom behaviour, which on a phone happens the moment a thumb
- * rests on the transcript, and nothing re-attaches it — so a call quietly stops
- * following itself. Re-anchoring on each new line, rather than on every streamed
- * word, keeps the conversation in view without fighting a reader who scrolled up
- * to re-read something while an utterance is still arriving.
- */
-export const ConversationAutoStick = ({ trigger }: { trigger: unknown }) => {
-  const { scrollToBottom } = useStickToBottomContext()
-  const first = useRef(true)
-  useEffect(() => {
-    if (first.current) {
-      first.current = false
-      return
-    }
-    void scrollToBottom()
-  }, [trigger, scrollToBottom])
-  return null
-}
-
 export const ConversationScrollButton = ({
   className,
   ...props
 }: ConversationScrollButtonProps) => {
-  const { isAtBottom, scrollToBottom } = useStickToBottomContext()
+  const { isAtBottom, scrollToBottom } = useConversation()
 
   const handleScrollToBottom = useCallback(() => {
     scrollToBottom()
@@ -110,6 +147,7 @@ export const ConversationScrollButton = ({
           className
         )}
         onClick={handleScrollToBottom}
+        aria-label="Scroll to latest message"
         size="icon"
         type="button"
         variant="outline"
