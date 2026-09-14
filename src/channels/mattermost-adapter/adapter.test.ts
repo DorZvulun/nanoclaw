@@ -124,7 +124,7 @@ describe('Mattermost posted-message threads', () => {
     );
   });
 
-  it('keeps ordinary top-level chatter in the shared channel context', async () => {
+  it('gives ordinary top-level group chatter its own inactive thread identity', async () => {
     const { adapter, processMessage } = await initializePostedHarness();
 
     adapter.handleSocketEvent(postedEvent({}));
@@ -132,11 +132,11 @@ describe('Mattermost posted-message threads', () => {
     await vi.waitFor(() => expect(processMessage).toHaveBeenCalledOnce());
     expect(processMessage).toHaveBeenCalledWith(
       adapter,
-      `mattermost:${CHANNEL_ID}`,
+      `mattermost:${CHANNEL_ID}:${POST_ID}`,
       expect.objectContaining({
         id: POST_ID,
         isMention: false,
-        threadId: `mattermost:${CHANNEL_ID}`,
+        threadId: `mattermost:${CHANNEL_ID}:${POST_ID}`,
       }),
     );
   });

@@ -824,7 +824,8 @@ export class MattermostAdapter implements Adapter<MattermostThreadId, Mattermost
     await this.ensureUserResolved(post.user_id);
 
     const isMention = isExplicitMention(event.data, this.botUserId);
-    const threadId = threadIdForPost(post, isMention);
+    const isDirect = data?.channel_type === 'D' || this.channelTypes.get(post.channel_id) === 'D';
+    const threadId = threadIdForPost(post, !isDirect);
     const message = this.toMessage(post, threadId);
     message.isMention = isMention;
 
@@ -1436,14 +1437,16 @@ export class MattermostAdapter implements Adapter<MattermostThreadId, Mattermost
 
 /**
  * Thread id a post belongs to: an existing root for a reply, the post itself
- * for a top-level mention, or the channel for ordinary top-level chatter.
+ * for any top-level group post, or the channel for a DM timeline.
  *
- * Rooting only addressed posts gives the bot a concrete reply target without
- * turning every channel message into a separate conversation. The host can
- * still collapse this id when a wiring disables threads.
+ * This matches Slack's conversation shape: each top-level channel message is
+ * the root of one isolated thread, whether or not it engages the bot. It keeps
+ * mention-sticky bounded to the mentioned thread and prevents an accumulated
+ * channel-level session from activating unrelated top-level chatter. The host
+ * can still collapse this id when a wiring disables threads.
  */
-function threadIdForPost(post: MattermostPost, rootTopLevelMention = false): string {
-  const rootId = post.root_id || (rootTopLevelMention ? post.id : undefined);
+function threadIdForPost(post: MattermostPost, rootTopLevel = false): string {
+  const rootId = post.root_id || (rootTopLevel ? post.id : undefined);
   return encodeThreadId({
     channelId: post.channel_id,
     ...(rootId ? { rootId } : {}),
