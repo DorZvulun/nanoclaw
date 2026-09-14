@@ -332,6 +332,8 @@ async function main(): Promise<void> {
     const groupPersona = await import('../src/group-persona.js');
     const containerConfigMod = await import('../src/container-config.js');
     const containerRunner = await import('../src/container-runner.js');
+    const providerContracts = await import('../src/provider-contracts/registry.js');
+    const projectDocCompose = await import('../src/project-doc-compose.js');
     const scheduling = await import('../src/modules/scheduling/create.js');
     const writeDestMod = await import('../src/modules/agent-to-agent/write-destinations.js');
     const configMod = await import('../src/config.js');
@@ -773,14 +775,14 @@ async function main(): Promise<void> {
 
     // ── Read back the composed surfaces ──
     // The composed project document is the read-only file mount nested on top
-    // of the group dir — found from the real mount table, not by name.
-    const docMount = mounts.find(
-      (m) =>
-        m.readonly &&
-        path.dirname(m.hostPath) === groupDir &&
-        fs.statSync(m.hostPath, { throwIfNoEntry: false })?.isFile(),
-    );
-    const docFile = docMount?.hostPath ?? path.join(groupDir, 'CLAUDE.md');
+    // of the group dir, named as buildMounts names it (provider contract →
+    // default). Match on the file name: container.json is also a read-only file
+    // in the group dir, and mount paths are realpaths (/private/var on macOS).
+    const docName =
+      providerContracts.getProviderHostContract(provider)?.projectDocument?.fileName ??
+      projectDocCompose.DEFAULT_PROJECT_DOC.fileName;
+    const docMount = mounts.find((m) => m.readonly && path.basename(m.hostPath) === docName);
+    const docFile = docMount?.hostPath ?? path.join(groupDir, docName);
     const composed = fs.existsSync(docFile) ? fs.readFileSync(docFile, 'utf8') : '';
     // Section index: the composer's `# <name>` blocks (fenced code skipped),
     // with word counts — the same shape a pod-side `awk` over the file gives.

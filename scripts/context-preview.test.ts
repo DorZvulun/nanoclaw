@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { spawnSync } from 'child_process';
 
@@ -19,7 +21,9 @@ describe('scripts/context-preview.ts', () => {
     const r = spawnSync('pnpm', ['exec', 'tsx', SCRIPT, 'first-message', '--json'], {
       cwd: REPO_ROOT,
       encoding: 'utf-8',
-      env: { ...process.env, LOG_LEVEL: 'warn' },
+      // Realpath'd TMPDIR: macOS's /var → /private/var symlink otherwise hides
+      // mount-path mismatches that Linux CI hits.
+      env: { ...process.env, LOG_LEVEL: 'warn', TMPDIR: fs.realpathSync(os.tmpdir()) },
       maxBuffer: 64 * 1024 * 1024,
     });
     expect(r.status, `context-preview failed:\n${r.stderr}`).toBe(0);
