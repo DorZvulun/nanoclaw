@@ -96,6 +96,8 @@ export interface GptLiveConfig {
   ui?: VoiceUiConfig;
   /** Bounds upstream creation, attach and cleanup requests. */
   requestTimeoutMs?: number;
+  maxCallDurationMs?: number;
+  maxCallsPerHour?: number;
 }
 
 export type { SidebandSocket } from './gpt-live-sideband.js';
@@ -140,6 +142,7 @@ interface LiveCall {
   ended: boolean;
   attachController: AbortController;
   cleanup?: Promise<void>;
+  expires?: ReturnType<typeof setTimeout>;
 }
 
 /**
@@ -158,7 +161,17 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
   const resolveAgent = config.resolveAgent ?? ((platformId: string) => resolveWiredAgent(platformId));
   const now = config.now ?? (() => Date.now());
   const requestTimeoutMs = config.requestTimeoutMs ?? 15_000;
+  const maxCallDurationMs = config.maxCallDurationMs ?? 15 * 60_000;
+  const maxCallsPerHour = config.maxCallsPerHour ?? 12;
+  for (const [name, value] of Object.entries({ requestTimeoutMs, maxCallDurationMs, maxCallsPerHour })) {
+    if (!Number.isSafeInteger(value) || value <= 0 || value > 2_147_483_647) {
+      throw new Error(`gpt-live: ${name} must be a positive bounded integer`);
+    }
+  }
   const cleanups = new Set<Promise<void>>();
+  const starts = new Map<string, number[]>();
+  const pendingStarts = new Map<string, number>();
+  let nextStart = 0;
   /** Active call per voice line, keyed by platform id. */
   const lines = new Map<string, LiveCall>();
   let setup: ChannelSetup | null = null;
@@ -203,9 +216,24 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
     });
   };
 
+  const hangupSession = async (sessionId: string): Promise<void> => {
+    try {
+      const res = await fetch(`${apiBase}/live/sessions/${encodeURIComponent(sessionId)}/hangup`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${config.apiKey}` },
+        signal: AbortSignal.timeout(requestTimeoutMs),
+      });
+      if (!res.ok && res.status !== 404) throw new Error(`hangup returned ${res.status}`);
+      await res.body?.cancel();
+    } catch (err) {
+      log.error('gpt-live: upstream hangup was not confirmed', { sessionId, err });
+    }
+  };
+
   const endCall = (call: LiveCall, reason: string): void => {
     if (call.ended) return;
     call.ended = true;
+    clearTimeout(call.expires);
     call.attachController.abort();
     if (lines.get(call.platformId) === call) lines.delete(call.platformId);
     const socket = call.socket;
@@ -214,23 +242,21 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
     // A sideband transport closing alone does not end the primary WebRTC call.
     // The REST control also works when the attach never opened.
     if (reason !== 'session.closed') {
-      const cleanup = fetch(`${apiBase}/live/sessions/${encodeURIComponent(call.session.sessionId)}/hangup`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${config.apiKey}` },
-        signal: AbortSignal.timeout(requestTimeoutMs),
-      })
-        .then(async (res) => {
-          if (!res.ok && res.status !== 404) throw new Error(`hangup returned ${res.status}`);
-          await res.body?.cancel();
-        })
-        .catch((err) => {
-          log.error('gpt-live: upstream hangup was not confirmed', { sessionId: call.session.sessionId, err });
-        })
-        .finally(() => cleanups.delete(cleanup));
+      const cleanup = hangupSession(call.session.sessionId).finally(() => cleanups.delete(cleanup));
       call.cleanup = cleanup;
       cleanups.add(cleanup);
     }
     log.info('gpt-live: call ended', { platformId: call.platformId, sessionId: call.session.sessionId, reason });
+  };
+
+  const closeCall = (call: LiveCall, reason: string): void => {
+    try {
+      call.session.close();
+    } catch (err) {
+      log.warn('gpt-live: close command failed; using HTTP hangup', { sessionId: call.session.sessionId, err });
+    } finally {
+      endCall(call, reason);
+    }
   };
 
   /** Attach the server-side sideband and pump its events into the call's state machine. */
@@ -262,8 +288,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
     const platformId = lineIdForToken(token);
     const previous = lines.get(platformId);
     if (previous) {
-      previous.session.close();
-      endCall(previous, 'replaced by a new call');
+      closeCall(previous, 'replaced by a new call');
     }
     const call: LiveCall = {
       platformId,
@@ -279,6 +304,8 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
       onClosed: (reason) => endCall(call, reason),
     });
     lines.set(platformId, call);
+    call.expires = setTimeout(() => closeCall(call, 'duration limit'), maxCallDurationMs);
+    call.expires.unref();
     let socket: SidebandSocket;
     try {
       socket = await connectSideband(call);
@@ -308,6 +335,8 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
       headers: { Authorization: `Bearer ${config.apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ session: sessionConfig(agent, config.voice), transport: { type: 'webrtc', sdp: offer } }),
       signal: AbortSignal.timeout(requestTimeoutMs),
+    }).catch((err) => {
+      throw new UpstreamError(502, 'gpt-live: session creation timed out or could not connect', { cause: err });
     });
     if (!res.ok) {
       throw new UpstreamError(
@@ -373,14 +402,34 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
         const offer = await readBody(req);
         if (!offer.trim().startsWith('v=')) return reply(res, 400, 'Body must be an SDP offer');
         const platformId = lineIdForToken(token);
-        const agent = (await resolveAgent(platformId)) ?? { name: config.fallbackAgentName };
-        const { sessionId, answer } = await createWebRtcSession(offer, agent);
-        log.info('gpt-live: session created', { platformId, sessionId, agent: agent.name });
+        const t = now();
+        const recent = (starts.get(platformId) ?? []).filter((at) => at > t - 3_600_000);
+        if (recent.length >= maxCallsPerHour) {
+          return reply(res, 429, 'This voice line has reached its hourly call limit. Try again later.', {
+            'Retry-After': String(Math.max(1, Math.ceil((recent[0] + 3_600_000 - t) / 1000))),
+          });
+        }
+        starts.set(platformId, [...recent, t]);
+        const attempt = ++nextStart;
+        pendingStarts.set(platformId, attempt);
+        let sessionId: string;
+        let answer: string;
         try {
+          const agent = (await resolveAgent(platformId)) ?? { name: config.fallbackAgentName };
+          ({ sessionId, answer } = await createWebRtcSession(offer, agent));
+          log.info('gpt-live: session created', { platformId, sessionId, agent: agent.name });
+          // Creation can finish out of order or after teardown / browser cancellation.
+          if (!connected || res.destroyed || pendingStarts.get(platformId) !== attempt) {
+            await hangupSession(sessionId);
+            if (!res.destroyed) reply(res, 409, 'This call attempt is no longer active');
+            return;
+          }
           await openCall(token, sessionId);
         } catch (err) {
           if (err instanceof CallReplacedError) return reply(res, 409, 'A newer call replaced this one');
           throw err;
+        } finally {
+          if (pendingStarts.get(platformId) === attempt) pendingStarts.delete(platformId);
         }
         reply(res, 200, answer, {
           'Content-Type': 'application/sdp',
@@ -393,8 +442,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
         if (!sessionId) return reply(res, 400, 'Session id is required');
         const call = lines.get(lineIdForToken(token));
         if (call?.session.sessionId === sessionId) {
-          call.session.close();
-          endCall(call, 'hangup');
+          closeCall(call, 'hangup');
           await call.cleanup;
         }
         reply(res, 204, '');
@@ -445,8 +493,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
     async teardown(): Promise<void> {
       connected = false;
       for (const call of [...lines.values()]) {
-        call.session.close();
-        endCall(call, 'teardown');
+        closeCall(call, 'teardown');
       }
       connected = false;
       setup = null;
@@ -527,6 +574,8 @@ registerChannelAdapter(CHANNEL_TYPE, {
       'GPT_LIVE_LINK_TOKEN',
       'GPT_LIVE_AGENT_NAME',
       'GPT_LIVE_UI',
+      'GPT_LIVE_MAX_CALL_SECONDS',
+      'GPT_LIVE_MAX_CALLS_PER_HOUR',
     ]);
     const key = resolveOpenAiKey(env);
     if (!key) return null;
@@ -542,6 +591,8 @@ registerChannelAdapter(CHANNEL_TYPE, {
       linkTokens: env.GPT_LIVE_LINK_TOKEN.split(','),
       fallbackAgentName: env.GPT_LIVE_AGENT_NAME || 'the assistant',
       ui: parseUiConfig(env.GPT_LIVE_UI),
+      maxCallDurationMs: Number(env.GPT_LIVE_MAX_CALL_SECONDS ?? 900) * 1000,
+      maxCallsPerHour: Number(env.GPT_LIVE_MAX_CALLS_PER_HOUR ?? 12),
     });
   },
   defaults: GPT_LIVE_DEFAULTS,

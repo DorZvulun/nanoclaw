@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { Duplex } from 'node:stream';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ChannelAdapter, InboundMessage } from './adapter.js';
 import { createGptLiveAdapter, lineIdForToken } from './voice.js';
@@ -107,6 +107,7 @@ interface FakeOpenAI {
   closedByClient: boolean;
   /** Delay the next attach's 101 by this many ms (consumed once) — lets two calls overlap. */
   nextAttachDelayMs: number;
+  nextCreateDelayMs: number;
   push(event: Record<string, unknown>): void;
   close(): Promise<void>;
 }
@@ -122,6 +123,7 @@ function startFakeOpenAI(): Promise<FakeOpenAI> {
     received: [],
     closedByClient: false,
     nextAttachDelayMs: 0,
+    nextCreateDelayMs: 0,
     push(event) {
       fake.attach.socket?.write(encodeFrame(0x1, Buffer.from(JSON.stringify(event))));
     },
@@ -154,14 +156,13 @@ function startFakeOpenAI(): Promise<FakeOpenAI> {
           auth: req.headers.authorization,
           body: JSON.parse(raw) as Record<string, unknown>,
         });
-        sessions += 1;
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(
-          JSON.stringify({
-            session: { id: `live_fake${sessions}` },
-            transport: { type: 'webrtc', sdp: 'v=0\r\nanswer' },
-          }),
-        );
+        const sessionId = `live_fake${++sessions}`;
+        const delay = fake.nextCreateDelayMs;
+        fake.nextCreateDelayMs = 0;
+        setTimeout(() => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ session: { id: sessionId }, transport: { type: 'webrtc', sdp: 'v=0\r\nanswer' } }));
+        }, delay);
         return;
       }
       res.writeHead(404);
@@ -525,5 +526,93 @@ describe('gpt-live adapter (fake OpenAI, real webhook server)', () => {
     const sdp = await fetch(`${base}/sdp?t=tok123`, { method: 'POST', body: 'v=0\r\noffer' });
     expect(sdp.status).toBe(503);
     expect(fake.sessionCreates.length).toBe(creates);
+  });
+});
+
+describe('voice call limits and pending creation', () => {
+  let fake: FakeOpenAI;
+  let adapter: ChannelAdapter;
+  let base: string;
+  let clock: number;
+  const offer = (token = 'limited') => fetch(`${base}/sdp?t=${token}`, { method: 'POST', body: 'v=0\r\noffer' });
+
+  beforeEach(async () => {
+    fake = await startFakeOpenAI();
+    const port = await freePort();
+    clock = Date.now();
+    vi.stubEnv('WEBHOOK_PORT', String(port));
+    base = `http://127.0.0.1:${port}/webhook/voice`;
+    adapter = createGptLiveAdapter({
+      apiKey: 'sk-test-key',
+      publicUrl: base,
+      voice: 'marin',
+      linkTokens: ['limited', 'other'],
+      fallbackAgentName: 'Agent',
+      apiBase: `http://127.0.0.1:${fake.port}/v1`,
+      wsBase: `ws://127.0.0.1:${fake.port}/v1`,
+      resolveAgent: async () => ({ name: 'Agent' }),
+      requestTimeoutMs: 500,
+      maxCallDurationMs: 300,
+      maxCallsPerHour: 2,
+      now: () => clock,
+    });
+    await adapter.setup({ onInbound: () => {}, onInboundEvent: () => {}, onMetadata: () => {}, onAction: () => {} });
+  });
+
+  afterEach(async () => {
+    await adapter.teardown();
+    await stopWebhookServer();
+    await fake.close();
+    vi.unstubAllEnvs();
+  });
+
+  it('rejects starts above the per-line hourly cap before contacting OpenAI and recovers next hour', async () => {
+    expect((await offer()).status).toBe(200);
+    expect((await offer()).status).toBe(200);
+    const capped = await offer();
+    expect(capped.status).toBe(429);
+    expect(Number(capped.headers.get('retry-after'))).toBeGreaterThan(0);
+    expect(fake.sessionCreates).toHaveLength(2);
+    expect((await offer('other')).status).toBe(200);
+    clock += 3_600_001;
+    expect((await offer()).status).toBe(200);
+  });
+
+  it('ends an unattended call at the duration limit, once', async () => {
+    const response = await offer();
+    const sessionId = response.headers.get('x-voice-session')!;
+    await vi.waitFor(() => expect(fake.hangups).toContain(sessionId));
+    expect(fake.hangups.filter((id) => id === sessionId)).toHaveLength(1);
+    await expect(
+      adapter.deliver(lineIdForToken('limited'), null, { kind: 'chat', content: { text: 'late' } }),
+    ).rejects.toThrow(/no active call/);
+  });
+
+  it('an older creation finishing late cannot replace the newer call', async () => {
+    fake.nextCreateDelayMs = 150;
+    const older = offer();
+    await vi.waitFor(() => expect(fake.sessionCreates).toHaveLength(1));
+    const newer = await offer();
+    expect(newer.status).toBe(200);
+    const newerId = newer.headers.get('x-voice-session');
+    expect((await older).status).toBe(409);
+    expect(fake.hangups).toContain('live_fake1');
+    expect(fake.hangups).not.toContain(newerId);
+    await adapter.deliver(lineIdForToken('limited'), null, { kind: 'chat', content: { text: 'Newer call' } });
+    await vi.waitFor(() =>
+      expect(fake.attaches.find((a) => a.sessionId === newerId)?.received.some((e) => e.content === 'Newer call')).toBe(
+        true,
+      ),
+    );
+  });
+
+  it('a creation completing after teardown is hung up and never attached', async () => {
+    fake.nextCreateDelayMs = 100;
+    const pending = offer();
+    await vi.waitFor(() => expect(fake.sessionCreates).toHaveLength(1));
+    await adapter.teardown();
+    expect((await pending).status).toBe(409);
+    expect(fake.hangups).toEqual(['live_fake1']);
+    expect(fake.attaches).toHaveLength(0);
   });
 });
