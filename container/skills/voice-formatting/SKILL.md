@@ -22,7 +22,9 @@ you reply is read aloud, so write for the ear.
   spoken chunks and the caller loses the thread. If there is more, say the
   headline and offer the rest: "Want the details?"
 - **Say what you did.** "I've moved the meeting to Thursday at ten." Not "Done."
-- **Ask one question at a time** when you need something from the caller.
+- **Ask one question at a time** in plain text when you need something from the caller.
+  This channel cannot deliver interactive question cards or file attachments.
+  Send files through another wired destination.
 - **Don't narrate tools or delays.** The voice model already keeps the caller
   company while you work.
 
@@ -34,6 +36,7 @@ assistant lines are what the voice model already said; don't repeat them.
 
 ## Proactive messages
 
-Anything you send to this conversation outside a delegation (a scheduled
-reminder, a follow-up) is spoken too. Keep it to one sentence and lead with
-why you are interrupting.
+While a call is active, a message outside a delegation (a reminder or
+follow-up) is spoken too. Keep it to one sentence and lead with why you are
+interrupting. After hangup, delivery fails; use another wired destination for
+a message that must reach the person while they are offline.

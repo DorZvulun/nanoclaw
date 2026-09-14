@@ -28,6 +28,8 @@ export interface AttachOptions {
   sessionId: string;
   onEvent: (event: LiveServerEvent) => void;
   onClose: (code: number, reason: string) => void;
+  timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 export function sidebandUrl(wsBase: string, sessionId: string): string {
@@ -41,13 +43,44 @@ export function attachSideband(opts: AttachOptions): Promise<SidebandSocket> {
       headers: { Authorization: `Bearer ${opts.apiKey}` },
     });
     let opened = false;
+    let finished = false;
+    const clearDeadline = () => {
+      clearTimeout(timer);
+      opts.signal?.removeEventListener('abort', cancelled);
+    };
+    const fail = (message: string) => {
+      if (finished) return;
+      finished = true;
+      clearDeadline();
+      ws.close();
+      reject(new Error(message));
+    };
+    const cancelled = () => fail('gpt-live: sideband attach cancelled');
+    const timer = setTimeout(() => fail('gpt-live: sideband attach timed out'), opts.timeoutMs ?? 15_000);
+    opts.signal?.addEventListener('abort', cancelled, { once: true });
+    if (opts.signal?.aborted) cancelled();
     ws.addEventListener('open', () => {
+      if (finished) {
+        ws.close();
+        return;
+      }
       opened = true;
+      clearDeadline();
       log.info('gpt-live: sideband attached', { sessionId: opts.sessionId });
-      resolve({ send: (data) => ws.send(data), close: () => ws.close() });
+      resolve({
+        send: (data) => {
+          if (finished) throw new Error('gpt-live: sideband is closed');
+          ws.send(data);
+        },
+        close: () => {
+          if (finished) return;
+          finished = true;
+          ws.close();
+        },
+      });
     });
     ws.addEventListener('message', (ev: MessageEvent) => {
-      if (typeof ev.data !== 'string') return;
+      if (finished || !opened || typeof ev.data !== 'string') return;
       let event: { type?: unknown } & Record<string, unknown>;
       try {
         event = JSON.parse(ev.data) as { type?: unknown } & Record<string, unknown>;
@@ -61,11 +94,14 @@ export function attachSideband(opts: AttachOptions): Promise<SidebandSocket> {
       opts.onEvent({ ...event, type: event.type });
     });
     ws.addEventListener('error', () => {
-      if (!opened) reject(new Error('gpt-live: sideband attach failed'));
+      if (!opened) fail('gpt-live: sideband attach failed');
       else log.warn('gpt-live: sideband socket error', { sessionId: opts.sessionId });
     });
     ws.addEventListener('close', (ev: { code: number; reason: string }) => {
-      if (opened) opts.onClose(ev.code, ev.reason);
+      if (!opened) return fail('gpt-live: sideband closed before opening');
+      if (finished) return;
+      finished = true;
+      opts.onClose(ev.code, ev.reason);
     });
   });
 }

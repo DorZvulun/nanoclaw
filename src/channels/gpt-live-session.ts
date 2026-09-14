@@ -145,8 +145,10 @@ export class GptLiveSession {
   speak(text: string, delegationId?: string | null): string[] {
     const chunks = chunkForAppend(text);
     if (this.closed || chunks.length === 0) return [];
-    const id = delegationId === undefined ? (this.pending.shift() ?? null) : delegationId;
-    return this.emitChunks('session.commentary.append', chunks, id);
+    const id = delegationId === undefined ? this.currentDelegation() : delegationId;
+    const ids = this.emitChunks('session.commentary.append', chunks, id);
+    if (delegationId === undefined) this.pending.shift();
+    return ids;
   }
 
   /** Silent progress note for the voice model ("still working"), about the oldest pending delegation. */
@@ -163,7 +165,12 @@ export class GptLiveSession {
   /** Ask the server to end the session. */
   close(): void {
     if (this.closed) return;
-    this.sink.send({ type: 'session.close' });
+    this.closed = true;
+    try {
+      this.sink.send({ type: 'session.close' });
+    } finally {
+      this.sink.onClosed('local close');
+    }
   }
 
   private emit(

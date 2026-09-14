@@ -97,6 +97,7 @@ interface FakeAttach {
 
 interface FakeOpenAI {
   port: number;
+  hangups: string[];
   sessionCreates: Array<{ auth: string | undefined; body: Record<string, unknown> }>;
   /** Every sideband attach in order; `attach` is the latest. */
   attaches: FakeAttach[];
@@ -115,6 +116,7 @@ function startFakeOpenAI(): Promise<FakeOpenAI> {
   const fake: FakeOpenAI = {
     port: 0,
     sessionCreates: [],
+    hangups: [],
     attaches: [],
     attach: {},
     received: [],
@@ -129,6 +131,14 @@ function startFakeOpenAI(): Promise<FakeOpenAI> {
     const chunks: Buffer[] = [];
     req.on('data', (c: Buffer) => chunks.push(c));
     req.on('end', () => {
+      const hangup = /^\/v1\/live\/sessions\/([^/]+)\/hangup$/.exec(req.url ?? '');
+      if (req.method === 'POST' && hangup) {
+        expect(req.headers.authorization).toBe('Bearer sk-test-key');
+        fake.hangups.push(hangup[1]);
+        res.writeHead(200);
+        res.end();
+        return;
+      }
       if (req.method === 'POST' && req.url === '/v1/live/sessions') {
         const raw = Buffer.concat(chunks).toString('utf8');
         if (raw.includes('fail-me')) {
@@ -171,8 +181,9 @@ function startFakeOpenAI(): Promise<FakeOpenAI> {
       received: [],
       closedByClient: false,
     };
-    setTimeout(() => {
-      fake.attaches.push(a);
+    fake.attaches.push(a);
+    const opening = setTimeout(() => {
+      if (socket.destroyed) return;
       fake.attach = { auth: a.auth, path: a.path, socket };
       socket.write(
         'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
@@ -197,6 +208,7 @@ function startFakeOpenAI(): Promise<FakeOpenAI> {
         } else if (f.opcode === 0x9) socket.write(encodeFrame(0xa, f.payload));
       }
     });
+    socket.on('close', () => clearTimeout(opening));
     socket.on('error', () => {});
   });
   return new Promise((resolve) => {
@@ -246,6 +258,7 @@ describe('gpt-live adapter (fake OpenAI, real webhook server)', () => {
       wsBase: `ws://127.0.0.1:${fake.port}/v1`,
       resolveAgent: async () => ({ name: 'Andy 🐾', personality: 'Dry humour, precise.' }),
       now: () => clock.now,
+      requestTimeoutMs: 500,
     });
     await adapter.setup({
       onInbound: (platformId, threadId, message) => {
@@ -269,7 +282,7 @@ describe('gpt-live adapter (fake OpenAI, real webhook server)', () => {
     expect(res.headers.get('content-type')).toContain('text/html');
     const html = await res.text();
     expect(html).toContain('RTCPeerConnection');
-    expect(html).toMatch(/new URL\(["']sdp\?t=/);
+    expect(html).toContain('x-voice-session');
   });
 
   it('refuses an SDP offer without a known link token', async () => {
@@ -293,7 +306,7 @@ describe('gpt-live adapter (fake OpenAI, real webhook server)', () => {
     });
     expect(res.status).toBe(200);
     expect(res.headers.get('x-voice-session')).toBe('live_fake1');
-    expect(res.headers.get('x-voice-agent')).toBe(encodeURIComponent('Andy 🐾'));
+    expect(res.headers.get('x-voice-agent')).toBeNull();
     expect(await res.text()).toBe('v=0\r\nanswer');
 
     expect(fake.sessionCreates).toHaveLength(1);
@@ -381,14 +394,15 @@ describe('gpt-live adapter (fake OpenAI, real webhook server)', () => {
     expect(count()).toBe(before);
   });
 
-  it('hangs up: closes the session, and later replies are dropped', async () => {
-    const res = await fetch(`${base}/hangup?t=tok123`, { method: 'POST' });
+  it('hangs up the specified session and rejects later replies', async () => {
+    const res = await fetch(`${base}/hangup?t=tok123&session=live_fake1`, { method: 'POST' });
     expect(res.status).toBe(204);
     await vi.waitFor(() => expect(fake.received.some((e) => e.type === 'session.close')).toBe(true));
     await vi.waitFor(() => expect(fake.closedByClient).toBe(true));
 
-    const id = await adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'too late' } });
-    expect(id).toBeUndefined();
+    await expect(adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'too late' } })).rejects.toThrow(
+      /no active call/,
+    );
   });
 
   it('two calls in flight on one link: the newest wins, the older is refused and its session closed', async () => {
@@ -414,12 +428,9 @@ describe('gpt-live adapter (fake OpenAI, real webhook server)', () => {
     const firstRes = await first;
     expect(firstRes.status).toBe(409);
 
-    // The loser's session was closed over its own sideband, and that sideband is gone.
-    await vi.waitFor(() => {
-      const loser = fake.attaches.find((a) => a.sessionId === loserId);
-      expect(loser?.received.some((e) => e.type === 'session.close')).toBe(true);
-      expect(loser?.closedByClient).toBe(true);
-    });
+    // Replacement cancels the pending handshake and ends its upstream session over HTTP.
+    await vi.waitFor(() => expect(fake.hangups).toContain(loserId));
+    expect(fake.hangups.filter((id) => id === loserId)).toHaveLength(1);
     const winner = fake.attaches.find((a) => a.sessionId === winnerId);
     expect(winner?.closedByClient).toBe(false);
 
@@ -431,6 +442,52 @@ describe('gpt-live adapter (fake OpenAI, real webhook server)', () => {
         true,
       ),
     );
+  });
+
+  it('a stale tab cannot hang up the newer call on the same line', async () => {
+    const winner = fake.attaches.at(-1)!;
+    const oldSession = fake.attaches.find((a) => a.sessionId !== winner.sessionId)!.sessionId;
+    expect((await fetch(`${base}/hangup?t=tok123&session=${oldSession}`, { method: 'POST' })).status).toBe(204);
+    expect((await fetch(`${base}/hangup?t=tok123`, { method: 'POST' })).status).toBe(400);
+    await adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'New call still connected.' } });
+    await vi.waitFor(() => expect(winner.received.some((e) => e.content === 'New call still connected.')).toBe(true));
+    expect(winner.closedByClient).toBe(false);
+  });
+
+  it('rejects question cards and attachments instead of falsely reporting delivery', async () => {
+    await expect(
+      adapter.deliver(LINE, null, {
+        kind: 'chat',
+        content: {
+          type: 'ask_question',
+          questionId: 'q1',
+          title: 'Choose a time',
+          question: 'When?',
+          options: ['Now', 'Later'],
+        },
+      }),
+    ).rejects.toThrow(/question cards/);
+    await expect(
+      adapter.deliver(LINE, null, {
+        kind: 'chat',
+        content: {},
+        files: [{ filename: 'report.txt', data: Buffer.from('report') }],
+      }),
+    ).rejects.toThrow(/attachments/);
+  });
+
+  it('bounds a stalled attach and hangs up the created upstream session', async () => {
+    const failedId = `live_fake${fake.sessionCreates.length + 1}`;
+    fake.nextAttachDelayMs = 1500;
+    const response = await fetch(`${base}/sdp?t=tok123`, { method: 'POST', body: 'v=0\r\noffer' });
+    expect(response.status).toBe(502);
+    expect(await response.text()).toContain('sideband attach failed');
+    expect(fake.hangups.filter((id) => id === failedId)).toHaveLength(1);
+    await expect(adapter.deliver(LINE, null, { kind: 'chat', content: { text: 'late' } })).rejects.toThrow(
+      /no active call/,
+    );
+    const next = await fetch(`${base}/sdp?t=tok123`, { method: 'POST', body: 'v=0\r\noffer' });
+    expect(next.status).toBe(200);
   });
 
   it('refuses an oversized SDP body with 413 before touching OpenAI', async () => {

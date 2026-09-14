@@ -94,6 +94,8 @@ export interface GptLiveConfig {
   now?: () => number;
   /** Look of the browser call page; injected at serve time, no rebuild needed (GPT_LIVE_UI). */
   ui?: VoiceUiConfig;
+  /** Bounds upstream creation, attach and cleanup requests. */
+  requestTimeoutMs?: number;
 }
 
 export type { SidebandSocket } from './gpt-live-sideband.js';
@@ -135,6 +137,9 @@ interface LiveCall {
   socket: SidebandSocket | null;
   /** When the last thinking note went out (config clock). */
   lastThinkAt: number;
+  ended: boolean;
+  attachController: AbortController;
+  cleanup?: Promise<void>;
 }
 
 /**
@@ -152,6 +157,8 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
   const tokens = new Set(config.linkTokens.map((t) => t.trim()).filter(Boolean));
   const resolveAgent = config.resolveAgent ?? ((platformId: string) => resolveWiredAgent(platformId));
   const now = config.now ?? (() => Date.now());
+  const requestTimeoutMs = config.requestTimeoutMs ?? 15_000;
+  const cleanups = new Set<Promise<void>>();
   /** Active call per voice line, keyed by platform id. */
   const lines = new Map<string, LiveCall>();
   let setup: ChannelSetup | null = null;
@@ -159,11 +166,9 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
 
   const sendEvent = (call: LiveCall, event: LiveClientEvent): void => {
     if (!call.socket) {
-      log.warn('gpt-live: no sideband for this call; dropping client event', {
-        sessionId: call.session.sessionId,
-        type: event.type,
-      });
-      return;
+      // A pending attach is cancelled through the HTTP hangup endpoint.
+      if (event.type === 'session.close') return;
+      throw new Error('gpt-live: no sideband for this call');
     }
     call.socket.send(JSON.stringify(event));
   };
@@ -199,10 +204,32 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
   };
 
   const endCall = (call: LiveCall, reason: string): void => {
+    if (call.ended) return;
+    call.ended = true;
+    call.attachController.abort();
     if (lines.get(call.platformId) === call) lines.delete(call.platformId);
     const socket = call.socket;
     call.socket = null;
     socket?.close();
+    // A sideband transport closing alone does not end the primary WebRTC call.
+    // The REST control also works when the attach never opened.
+    if (reason !== 'session.closed') {
+      const cleanup = fetch(`${apiBase}/live/sessions/${encodeURIComponent(call.session.sessionId)}/hangup`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${config.apiKey}` },
+        signal: AbortSignal.timeout(requestTimeoutMs),
+      })
+        .then(async (res) => {
+          if (!res.ok && res.status !== 404) throw new Error(`hangup returned ${res.status}`);
+          await res.body?.cancel();
+        })
+        .catch((err) => {
+          log.error('gpt-live: upstream hangup was not confirmed', { sessionId: call.session.sessionId, err });
+        })
+        .finally(() => cleanups.delete(cleanup));
+      call.cleanup = cleanup;
+      cleanups.add(cleanup);
+    }
     log.info('gpt-live: call ended', { platformId: call.platformId, sessionId: call.session.sessionId, reason });
   };
 
@@ -212,13 +239,15 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
       wsBase,
       apiKey: config.apiKey,
       sessionId: call.session.sessionId,
+      timeoutMs: requestTimeoutMs,
+      signal: call.attachController.signal,
       onEvent: (event) => {
         config.onSidebandEvent?.(call.session.sessionId, event);
         call.session.handle(event);
       },
       onClose: (code, reason) => {
         // The server closing the sideband means the session is over for us.
-        if (!call.session.isClosed()) call.session.handle({ type: 'session.closed', code, reason });
+        if (!call.session.isClosed()) call.session.handle({ type: 'transport.failed', code, reason });
       },
     });
 
@@ -241,6 +270,8 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
       socket: null,
       session: null as unknown as GptLiveSession,
       lastThinkAt: 0,
+      ended: false,
+      attachController: new AbortController(),
     };
     call.session = new GptLiveSession(sessionId, {
       send: (event) => sendEvent(call, event),
@@ -252,7 +283,9 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
     try {
       socket = await connectSideband(call);
     } catch (err) {
+      if (call.ended && connected) throw new CallReplacedError(platformId);
       endCall(call, 'sideband attach failed');
+      await call.cleanup;
       throw new UpstreamError(502, 'gpt-live: sideband attach failed', { cause: err });
     }
     if (lines.get(platformId) !== call) {
@@ -274,6 +307,7 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
       method: 'POST',
       headers: { Authorization: `Bearer ${config.apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ session: sessionConfig(agent, config.voice), transport: { type: 'webrtc', sdp: offer } }),
+      signal: AbortSignal.timeout(requestTimeoutMs),
     });
     if (!res.ok) {
       throw new UpstreamError(
@@ -351,18 +385,17 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
         reply(res, 200, answer, {
           'Content-Type': 'application/sdp',
           'X-Voice-Session': sessionId,
-          // Node rejects non-Latin-1 response header values. Keep the header
-          // ASCII-safe so a display name cannot throw after the billed live
-          // session has already started; /info still returns the raw name.
-          'X-Voice-Agent': encodeURIComponent(agent.name),
         });
         return;
       }
       if (route === 'hangup') {
+        const sessionId = url.searchParams.get('session');
+        if (!sessionId) return reply(res, 400, 'Session id is required');
         const call = lines.get(lineIdForToken(token));
-        if (call) {
+        if (call?.session.sessionId === sessionId) {
           call.session.close();
           endCall(call, 'hangup');
+          await call.cleanup;
         }
         reply(res, 204, '');
         return;
@@ -403,19 +436,21 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
       registerWebhookHandler(CHANNEL_TYPE, handleHttp);
       connected = true;
       log.info('gpt-live: ready', {
-        callUrl: `${config.publicUrl}/webhook/voice/call?t=<link token>`,
+        callUrl: `${config.publicUrl.replace(/\/+$/, '')}/webhook/voice/call?t=<link token>`,
         lines: tokens.size,
         voice: config.voice,
       });
     },
 
     async teardown(): Promise<void> {
+      connected = false;
       for (const call of [...lines.values()]) {
         call.session.close();
         endCall(call, 'teardown');
       }
       connected = false;
       setup = null;
+      await Promise.all([...cleanups]);
     },
 
     isConnected(): boolean {
@@ -423,14 +458,15 @@ export function createGptLiveAdapter(config: GptLiveConfig): ChannelAdapter {
     },
 
     async deliver(platformId: string, _threadId: string | null, message: OutboundMessage): Promise<string | undefined> {
-      const call = lines.get(platformId);
-      if (!call) {
-        log.warn('gpt-live: no active call on this line; dropping reply', { platformId });
-        return undefined;
+      const content = message.content as { text?: unknown; type?: unknown } | string;
+      if (typeof content === 'object' && content?.type === 'ask_question') {
+        throw new Error('gpt-live: question cards are unsupported; ask the caller in plain text');
       }
-      const content = message.content as { text?: unknown } | string;
+      if (message.files?.length) throw new Error('gpt-live: attachments cannot be delivered over a voice call');
+      const call = lines.get(platformId);
+      if (!call || call.session.isClosed() || !call.socket) throw new Error('gpt-live: no active call on this line');
       const text = typeof content === 'string' ? content : typeof content?.text === 'string' ? content.text : '';
-      if (!text.trim()) return undefined;
+      if (!text.trim()) throw new Error('gpt-live: reply contains no speakable text');
       const ids = call.session.speak(text);
       return ids.at(-1);
     },

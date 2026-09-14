@@ -152,6 +152,20 @@ describe('GptLiveSession', () => {
     expect(sent).toEqual([]);
   });
 
+  it('closes locally once and ignores late server events and replies', () => {
+    const { session, sent, closed, delegations } = recorder();
+    session.close();
+    session.close();
+    session.handle({ type: 'session.closed' });
+    callerSays(session, 'too late');
+    delegate(session, 'late');
+    expect(session.isClosed()).toBe(true);
+    expect(sent).toEqual([{ type: 'session.close' }]);
+    expect(closed).toHaveLength(1);
+    expect(delegations).toEqual([]);
+    expect(session.speak('too late')).toEqual([]);
+  });
+
   it('ignores events it does not track', () => {
     const { session, sent, delegations } = recorder();
     session.handle({ type: 'session.usage.updated', usage: {} });
@@ -174,6 +188,3 @@ describe('chunkForAppend', () => {
     expect(chunks.join(' ')).toBe(words);
   });
 });
-
-// Adapter-level behaviour, covered once GL-03 and GL-05 land (see the board tracker).
-describe.todo('gpt-live adapter');
