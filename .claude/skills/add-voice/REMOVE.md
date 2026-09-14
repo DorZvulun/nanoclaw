@@ -15,10 +15,10 @@ sed -i.bak "/^import '\.\/voice\.js';$/d" src/channels/index.ts && rm -f src/cha
 ## 2. Remove the copied files
 
 The adapter, its state machine, prompt composer, call page, sideband, Keychain
-reader, and the four tests:
+reader, and the seven tests:
 
 ```bash
-rm -f src/channels/voice.ts src/channels/gpt-live-session.ts src/channels/gpt-live-prompt.ts src/channels/gpt-live-call-page.ts src/channels/gpt-live-keychain.ts src/channels/gpt-live-sideband.ts src/channels/voice-adapter.test.ts src/channels/voice-registration.test.ts src/channels/gpt-live-session.test.ts src/channels/gpt-live-keychain.test.ts src/channels/gpt-live-call-page.test.ts
+rm -f src/channels/voice.ts src/channels/gpt-live-session.ts src/channels/gpt-live-prompt.ts src/channels/gpt-live-call-page.ts src/channels/gpt-live-keychain.ts src/channels/gpt-live-sideband.ts src/channels/voice-adapter.test.ts src/channels/voice-registration.test.ts src/channels/gpt-live-session.test.ts src/channels/gpt-live-access.test.ts src/channels/gpt-live-keychain.test.ts src/channels/gpt-live-sideband.test.ts src/channels/gpt-live-call-page.test.ts
 ```
 
 ## 3. Remove the container skill
@@ -36,7 +36,7 @@ rm -rf container/skills/voice-formatting
 (check `.env` for other OpenAI consumers first):
 
 ```bash
-sed -i.bak '/^GPT_LIVE_PUBLIC_URL=/d;/^GPT_LIVE_VOICE=/d;/^GPT_LIVE_LINK_TOKEN=/d;/^GPT_LIVE_AGENT_NAME=/d;/^GPT_LIVE_KEYCHAIN_SERVICE=/d;/^GPT_LIVE_KEYCHAIN_ACCOUNT=/d' .env && rm -f .env.bak
+sed -i.bak '/^GPT_LIVE_PUBLIC_URL=/d;/^GPT_LIVE_VOICE=/d;/^GPT_LIVE_LINK_TOKEN=/d;/^GPT_LIVE_AGENT_NAME=/d;/^GPT_LIVE_UI=/d;/^GPT_LIVE_MAX_CALL_SECONDS=/d;/^GPT_LIVE_MAX_CALLS_PER_HOUR=/d;/^GPT_LIVE_KEYCHAIN_SERVICE=/d;/^GPT_LIVE_KEYCHAIN_ACCOUNT=/d' .env && rm -f .env.bak
 # only if no other consumer:
 # sed -i.bak '/^OPENAI_API_KEY=/d' .env && rm -f .env.bak
 ```
@@ -51,6 +51,8 @@ pnpm run build
 bash setup/lib/restart.sh
 ```
 
-The voice line's messaging group and wiring are runtime data; delete them with
-`ncl wirings delete` and `ncl messaging-groups delete` if you no longer want
-them listed. The OpenAI project and its key are managed on OpenAI's side.
+The named voice user, membership, messaging group and wiring are runtime data.
+Remove membership with `ncl members remove --user <voice-id> --group <agent-id>`
+and delete the wiring and messaging group with `ncl wirings delete` and
+`ncl messaging-groups delete` if you no longer want them listed. Retain the
+user record when keeping call history. The OpenAI project and its key are managed on OpenAI's side.

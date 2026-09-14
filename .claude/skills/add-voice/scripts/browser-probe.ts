@@ -83,17 +83,22 @@ const adapter = createGptLiveAdapter({
   publicUrl: `http://127.0.0.1:${port}`,
   voice: env.GPT_LIVE_VOICE || 'marin',
   linkTokens: ['probe'],
-  fallbackAgentName: 'Andy',
-  resolveAgent: async () => ({ name: 'Andy', personality: 'Calm, precise, a little dry.' }),
+  resolveLine: async (id) => ({
+    caller: { id, name: 'Test caller' },
+    agentGroupId: 'probe',
+    agent: { name: 'Andy', personality: 'Calm, precise, a little dry.' },
+  }),
   onSidebandEvent: (sessionId, e) => {
     const type = String(e.type);
-    if (type === 'session.input_transcript.delta') line(`[${sessionId}] caller: ${JSON.stringify(String(e.delta ?? ''))}`);
+    if (type === 'session.input_transcript.delta')
+      line(`[${sessionId}] caller: ${JSON.stringify(String(e.delta ?? ''))}`);
     else if (type === 'session.output_transcript.delta') {
       const before = outputTx.get(sessionId) ?? '';
       const soFar = before + String(e.delta ?? '');
       outputTx.set(sessionId, soFar);
       line(`[${sessionId}] assistant: ${JSON.stringify(String(e.delta ?? ''))}`);
-      if (!REPLY_MARKER.test(before) && REPLY_MARKER.test(soFar)) line(`[${sessionId}] >>> the backend reply is being spoken`);
+      if (!REPLY_MARKER.test(before) && REPLY_MARKER.test(soFar))
+        line(`[${sessionId}] >>> the backend reply is being spoken`);
     } else if (type === 'session.delegation.created') {
       const d = e.delegation as { id?: string } | undefined;
       line(`[${sessionId}] delegation.created id=${d?.id}`);
