@@ -90,6 +90,11 @@ async function initializePostedHarness(): Promise<{
 }
 
 describe('Mattermost posted-message threads', () => {
+  it('reports no live transport when initialized without a socket', async () => {
+    const { adapter } = await initializePostedHarness();
+    expect(adapter.isConnected()).toBe(false);
+  });
+
   it('keeps fetched-message thread identity stable as DM state warms', async () => {
     const { adapter, processMessage } = await initializePostedHarness();
     const event = postedEvent({ mentions: [BOT_ID] });

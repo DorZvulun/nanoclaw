@@ -315,6 +315,11 @@ export class MattermostAdapter implements Adapter<MattermostThreadId, Mattermost
     this.socket = undefined;
   }
 
+  /** Whether the authenticated WebSocket transport is currently usable. */
+  isConnected(): boolean {
+    return this.socket?.connected === true;
+  }
+
   // =========================================================================
   // Thread id codecs
   // =========================================================================
