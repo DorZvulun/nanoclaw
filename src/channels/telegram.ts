@@ -12,6 +12,14 @@
  */
 import { createTelegramAdapter } from '@chat-adapter/telegram';
 
+/**
+ * Where the Bot API lives. `@chat-adapter/telegram` reads the same variable for its own
+ * calls (its `apiBaseUrl` default); the three fetches this module makes itself must agree,
+ * or a rehearsal against a local Bot API server (backlot) sends getMe, the pairing replies
+ * and getChat to production while the adapter polls the mock. Production leaves it unset.
+ */
+const TELEGRAM_API_BASE_URL = (process.env.TELEGRAM_API_BASE_URL ?? 'https://api.telegram.org').replace(/\/+$/, '');
+
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 import { createMessagingGroup, getMessagingGroupByPlatform, updateMessagingGroup } from '../db/messaging-groups.js';
@@ -68,7 +76,7 @@ function extractReplyContext(raw: Record<string, any>): ReplyContext | null {
 /** Look up the bot username via Telegram getMe. Cached after first call. */
 async function fetchBotUsername(token: string): Promise<string | null> {
   try {
-    const res = await fetch(`https://api.telegram.org/bot${token}/getMe`);
+    const res = await fetch(`${TELEGRAM_API_BASE_URL}/bot${token}/getMe`);
     const json = (await res.json()) as { ok: boolean; result?: { username?: string } };
     return json.ok ? (json.result?.username ?? null) : null;
   } catch (err) {
@@ -125,7 +133,7 @@ async function sendTelegramMessage(token: string, platformId: string, body: Reco
   const chatId = platformId.split(':').slice(1).join(':');
   if (!chatId) return;
   try {
-    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    const res = await fetch(`${TELEGRAM_API_BASE_URL}/bot${token}/sendMessage`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ chat_id: chatId, ...body }),
@@ -402,7 +410,7 @@ export function createTelegramBridge(options: TelegramBridgeOptions = {}): Chann
       const chatId = platformId.split(':').slice(1).join(':');
       if (!chatId) return null;
       try {
-        const res = await fetch(`https://api.telegram.org/bot${token}/getChat`, {
+        const res = await fetch(`${TELEGRAM_API_BASE_URL}/bot${token}/getChat`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ chat_id: chatId }),
