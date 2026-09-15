@@ -4,8 +4,6 @@ All notable changes to NanoClaw will be documented in this file.
 
 ## [Unreleased]
 
-- [BREAKING] **Mattermost interactive callbacks require a nonblank secret.** Missing credentials fail closed, and external button integrations no longer receive the adapter secret. **Migration:** follow [the callback security guide](docs/mattermost-callback-security.md) before refreshing an installed adapter.
-
 - **New NanoClaw installs now use OneCLI gateway 1.41.0.** Existing 1.36.0 gateways remain compatible because NanoClaw does not depend on any 1.41-only behavior. See [the OneCLI upgrade guide](docs/onecli-upgrades.md) to upgrade an existing gateway.
 
 ## [2.2.0] - 2026-08-13

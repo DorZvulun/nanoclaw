@@ -105,8 +105,7 @@ function requireCallbackSecret(options: MattermostAdapterOptions): string | unde
     throw new Error(
       'MattermostAdapter: callbackUrl is set but callbackSecret is missing or blank. ' +
         'Set callbackSecret (MATTERMOST_CALLBACK_SECRET) to authenticate interactive clicks. ' +
-        'Only isolated local tests may set allowUnauthenticatedCallbacks: true. ' +
-        'See docs/mattermost-callback-security.md for migration.',
+        'Only isolated local tests may set allowUnauthenticatedCallbacks: true.',
     );
   }
   return undefined;

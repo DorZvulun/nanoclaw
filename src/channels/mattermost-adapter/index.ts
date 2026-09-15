@@ -107,6 +107,6 @@ export function createMattermostAdapter(config: MattermostAdapterConfig = {}): M
     ...(resolvedCallbackUrl ? { callbackUrl: resolvedCallbackUrl } : {}),
     ...(resolvedCallbackSecret ? { callbackSecret: resolvedCallbackSecret } : {}),
     ...(resolvedTeam ? { team: resolvedTeam } : {}),
-    ...(resolvedAllowUnauthenticated ? { allowUnauthenticatedCallbacks: true } : {}),
+    ...(resolvedAllowUnauthenticated === true ? { allowUnauthenticatedCallbacks: true } : {}),
   });
 }

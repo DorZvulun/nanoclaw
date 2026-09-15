@@ -395,6 +395,16 @@ describe('Mattermost callback configuration', () => {
     );
   });
 
+  it.each(['false', 'true', 1, [], {}])('rejects a non-boolean config opt-out (%j)', (value) => {
+    environment();
+    for (const envValue of ['', 'true']) {
+      vi.stubEnv('MATTERMOST_ALLOW_UNAUTHENTICATED_CALLBACKS', envValue);
+      expect(() => createMattermostAdapter({ allowUnauthenticatedCallbacks: value as unknown as boolean })).toThrow(
+        /callbackSecret is missing or blank/,
+      );
+    }
+  });
+
   it.each(['TRUE', '1', 'false'])('does not interpret %s as permission to skip authentication', (value) => {
     environment();
     vi.stubEnv('MATTERMOST_ALLOW_UNAUTHENTICATED_CALLBACKS', value);
