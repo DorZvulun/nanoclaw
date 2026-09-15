@@ -135,7 +135,7 @@ account and fails here if the token is bad. You'll use the handle to open the
 right chat just before pairing:
 
 ```nc:run capture:bot_username effect:fetch
-curl -sf https://api.telegram.org/bot{{bot_token}}/getMe | jq -er '.result.username'
+curl -sf "${TELEGRAM_API_BASE_URL:-https://api.telegram.org}"/bot{{bot_token}}/getMe | jq -er '.result.username'
 ```
 
 ### Add another bot
@@ -173,7 +173,7 @@ Then confirm its token with `getMe` as above:
 Paste the second bot's token from BotFather (looks like `123456:ABC-DEF...`). It must belong to a different bot than the one already configured.
 ```
 ```nc:run capture:bot_username_2 effect:fetch when:add_another=yes
-curl -sf https://api.telegram.org/bot{{bot_token_2}}/getMe | jq -er '.result.username'
+curl -sf "${TELEGRAM_API_BASE_URL:-https://api.telegram.org}"/bot{{bot_token_2}}/getMe | jq -er '.result.username'
 ```
 
 A second token that resolves to the same bot as the first (its handle matches) is
