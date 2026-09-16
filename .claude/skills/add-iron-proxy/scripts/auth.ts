@@ -19,11 +19,30 @@ function answer<T>(value: T | symbol): T {
   return value as T;
 }
 
+/**
+ * The prompt-free credential path. An OAuth token (`sk-ant-oat…`) is presented
+ * by the SDK as `Authorization: Bearer`, an API key as `x-api-key`; storing a
+ * token under ANTHROPIC_API_KEY makes every model request fail with 401, so the
+ * value's own prefix decides the auth variable, whichever env var carried it.
+ */
+export function suppliedCredential(
+  env: NodeJS.ProcessEnv = process.env,
+): { secret: string; authEnv: 'ANTHROPIC_API_KEY' | 'CLAUDE_CODE_OAUTH_TOKEN' } | undefined {
+  const token = (env.NANOCLAW_CLAUDE_CODE_OAUTH_TOKEN || env.CLAUDE_CODE_OAUTH_TOKEN)?.trim();
+  if (token) return { secret: token, authEnv: 'CLAUDE_CODE_OAUTH_TOKEN' };
+  const key = (env.NANOCLAW_ANTHROPIC_API_KEY || env.ANTHROPIC_API_KEY)?.trim();
+  if (!key) return undefined;
+  return { secret: key, authEnv: key.startsWith('sk-ant-oat') ? 'CLAUDE_CODE_OAUTH_TOKEN' : 'ANTHROPIC_API_KEY' };
+}
+
 export async function existingCredential(root = process.cwd()): Promise<boolean> {
   if (fs.existsSync(controlPaths(root).registration)) {
     let credential;
     try {
-      credential = await controlRequest(root, `static_secrets/lookup/${encodeURIComponent(getInstallSlug(root))}/nanoclaw-model`);
+      credential = await controlRequest(
+        root,
+        `static_secrets/lookup/${encodeURIComponent(getInstallSlug(root))}/nanoclaw-model`,
+      );
     } catch (error) {
       if (error instanceof IronControlRequestError && error.status === 404) return false;
       throw error; // A control outage is not a missing login.
@@ -97,17 +116,17 @@ export async function run(agentProvider = process.argv[2] || 'claude', root = pr
     p.log.success('Claude endpoint connected through Iron Proxy.');
     return;
   }
-  const suppliedApiKey = (process.env.NANOCLAW_ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY)?.trim();
-  if (suppliedApiKey) {
+  const supplied = suppliedCredential();
+  if (supplied) {
     await configureCredential(
-      {
-        secret: suppliedApiKey,
-        authEnv: 'ANTHROPIC_API_KEY',
-        modelHost: new URL(getProviderModelEndpoint('claude', 'api')).hostname,
-      },
+      { ...supplied, modelHost: new URL(getProviderModelEndpoint('claude', 'api')).hostname },
       root,
     );
-    p.log.success('Claude API connected through Iron Proxy.');
+    p.log.success(
+      supplied.authEnv === 'ANTHROPIC_API_KEY'
+        ? 'Claude API connected through Iron Proxy.'
+        : 'Claude OAuth token connected through Iron Proxy.',
+    );
     return;
   }
   if (await existingCredential(root)) {
