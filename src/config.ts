@@ -21,6 +21,7 @@ const envConfig = readEnvFile([
   'NANOCLAW_EGRESS_LOCKDOWN',
   'NANOCLAW_EGRESS_NETWORK',
   'ONECLI_GATEWAY_CONTAINER',
+  'WEBHOOK_PORT',
   'NANOCLAW_IDLE_TIMEOUT_MS',
 ]);
 
@@ -119,6 +120,16 @@ export const ONECLI_GATEWAY_CONTAINER =
 // Raw string here; parsed + validated where it is consumed (host-sweep.ts),
 // so an invalid value falls back to the built-in default instead of NaN.
 export const IDLE_TIMEOUT_MS_RAW = process.env.NANOCLAW_IDLE_TIMEOUT_MS || envConfig.NANOCLAW_IDLE_TIMEOUT_MS || '';
+
+// Resolve when the listener starts so a late process override still wins.
+export function getWebhookPort(): number {
+  const raw = process.env.WEBHOOK_PORT || envConfig.WEBHOOK_PORT || '3000';
+  const port = Number(raw);
+  if (!/^[1-9]\d*$/.test(raw) || !Number.isInteger(port) || port > 65_535) {
+    throw new Error(`Invalid WEBHOOK_PORT ${JSON.stringify(raw)}: expected an integer from 1 to 65535`);
+  }
+  return port;
+}
 
 // Timezone for scheduled tasks, message formatting, etc.
 // Validates each candidate is a real IANA identifier before accepting.
