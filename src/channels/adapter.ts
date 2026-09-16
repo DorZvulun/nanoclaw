@@ -98,8 +98,17 @@ export interface OutboundFile {
   data: Buffer;
 }
 
+/** Trusted host provenance. Never parsed from agent-controlled content. */
+export interface DeliverySource {
+  messageId: string;
+  sessionId: string;
+  agentGroupId: string;
+  timestamp: string;
+}
+
 /** Outbound message from host to adapter. */
 export interface OutboundMessage {
+  source?: DeliverySource;
   kind: string;
   content: unknown; // parsed JSON from messages_out
   files?: OutboundFile[]; // file attachments from the session outbox

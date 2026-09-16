@@ -1,0 +1,42 @@
+diff --git a/src/channels/adapter.ts b/src/channels/adapter.ts
+index 5315c421..baea34df 100644
+--- a/src/channels/adapter.ts
++++ b/src/channels/adapter.ts
+@@ -100,0 +101,8 @@ export interface OutboundFile {
++/** Trusted host provenance. Never parsed from agent-controlled content. */
++export interface DeliverySource {
++  messageId: string;
++  sessionId: string;
++  agentGroupId: string;
++  timestamp: string;
++}
++
+@@ -102,0 +111 @@ export interface OutboundMessage {
++  source?: DeliverySource;
+diff --git a/src/channels/channel-registry.ts b/src/channels/channel-registry.ts
+index 692dde9d..4443410b 100644
+--- a/src/channels/channel-registry.ts
++++ b/src/channels/channel-registry.ts
+@@ -108,0 +109 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
++      source?: import('./adapter.js').DeliverySource,
+@@ -114 +115,6 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
+-      return adapter.deliver(platformId, threadId, { kind, content: JSON.parse(content), files });
++      return adapter.deliver(platformId, threadId, {
++        kind,
++        content: JSON.parse(content),
++        files,
++        ...(source ? { source } : {}),
++      });
+diff --git a/src/delivery.ts b/src/delivery.ts
+index 5cdcd7be..b34e9aa9 100644
+--- a/src/delivery.ts
++++ b/src/delivery.ts
+@@ -102,0 +103 @@ export interface ChannelDeliveryAdapter {
++    source?: import('./channels/adapter.js').DeliverySource,
+@@ -500,0 +502,6 @@ async function deliverMessage(
++    {
++      messageId: msg.id,
++      sessionId: session.id,
++      agentGroupId: session.agent_group_id,
++      timestamp: new Date().toISOString(),
++    },
