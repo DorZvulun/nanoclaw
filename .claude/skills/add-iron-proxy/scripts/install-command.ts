@@ -6,6 +6,8 @@ interface InstallCommandOptions {
   cwd?: string;
   capture?: boolean;
   failureHint?: string;
+  /** Reported instead of the failure message when a non-zero exit is an expected outcome (a cache probe). */
+  absentHint?: string;
   /** Test seams; production uses bounded ten-second progress updates. */
   heartbeatMs?: number;
   killGraceMs?: number;
@@ -94,7 +96,10 @@ export function installCommand(command: string, args: string[], options: Install
         report(`${options.label}: done (${elapsed()})`);
         resolve(output.trim());
       } else {
-        const message = `${options.label} ${reason || `failed (exit ${code ?? 'unknown'})`}. ${options.failureHint ?? 'Check the service and retry this step.'}`;
+        const message =
+          !reason && options.absentHint
+            ? `${options.label}: ${options.absentHint}`
+            : `${options.label} ${reason || `failed (exit ${code ?? 'unknown'})`}. ${options.failureHint ?? 'Check the service and retry this step.'}`;
         report(message);
         reject(new InstallCommandFailure(message, Boolean(reason)));
       }

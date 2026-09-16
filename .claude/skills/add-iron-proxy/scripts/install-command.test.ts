@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { installCommand, installStep } from './install-command.js';
+import { installCommand, InstallCommandFailure, installStep } from './install-command.js';
 
 const node = (source: string) => [process.execPath, ['-e', source]] as const;
 
@@ -89,6 +89,21 @@ describe('Iron installer progress and process bounds', () => {
       }),
     ).rejects.toThrow('timed out');
     expect(Date.now() - start).toBeLessThan(2000);
+  });
+
+  it('reports an expected miss without the failure wording, still rejecting', async () => {
+    const lines: string[] = [];
+    await expect(
+      installCommand(process.execPath, ['-e', 'process.exit(1)'], {
+        label: 'Check cached image',
+        timeoutMs: 5000,
+        absentHint: 'not cached; building it',
+        report: (line) => lines.push(line),
+      }),
+    ).rejects.toBeInstanceOf(InstallCommandFailure);
+    expect(lines).toContain('Check cached image: not cached; building it');
+    expect(lines.join('\n')).not.toContain('failed (exit');
+    expect(lines.join('\n')).not.toContain('Check the service');
   });
 
   it('emits the skill streaming terminal status for success and failure', async () => {

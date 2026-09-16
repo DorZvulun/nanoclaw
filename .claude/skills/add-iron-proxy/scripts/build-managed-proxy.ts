@@ -47,6 +47,7 @@ export async function buildManagedProxy(): Promise<string> {
         label: 'Check cached Iron Proxy image',
         timeoutMs: 15_000,
         capture: true,
+        absentHint: 'not cached; building it from the pinned source',
       }),
     )[0];
     if (hasFrontProxy(image)) return image.Id;
