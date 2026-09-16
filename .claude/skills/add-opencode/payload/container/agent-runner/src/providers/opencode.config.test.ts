@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from 'bun:test';
 
-import { buildOpenCodeConfig } from './opencode-config.js';
+import { buildOpenCodeConfig, resolveOpenCodePromptModel } from './opencode-config.js';
 
 const ENV_KEYS = [
   'OPENCODE_PROVIDER',
@@ -18,6 +18,25 @@ afterEach(() => {
     if (saved[k] === undefined) delete process.env[k];
     else process.env[k] = saved[k];
   }
+});
+
+describe('resolveOpenCodePromptModel', () => {
+  it('splits the configured provider/model for the prompt API', () => {
+    expect(resolveOpenCodePromptModel({ model: 'openai/gpt-5.6-sol' })).toEqual({
+      providerID: 'openai',
+      modelID: 'gpt-5.6-sol',
+    });
+    expect(resolveOpenCodePromptModel({ model: 'openrouter/anthropic/claude-sonnet-4' })).toEqual({
+      providerID: 'openrouter',
+      modelID: 'anthropic/claude-sonnet-4',
+    });
+  });
+
+  it('leaves OpenCode its default for a missing or malformed model', () => {
+    expect(resolveOpenCodePromptModel({})).toBeUndefined();
+    expect(resolveOpenCodePromptModel({ model: 'gpt-5.6-sol' })).toBeUndefined();
+    expect(resolveOpenCodePromptModel({ model: 'openai/' })).toBeUndefined();
+  });
 });
 
 describe('buildOpenCodeConfig provider transport', () => {

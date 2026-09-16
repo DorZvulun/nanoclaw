@@ -155,6 +155,23 @@ export function resolveOpenCodeInference(
   };
 }
 
+/**
+ * The configured `provider/model` as the prompt API names it. OpenCode stores
+ * the model a session was created with and reuses it on resume, so a group
+ * whose backend or model changed would keep prompting the old one and fail
+ * with "Model not found"; naming the model on every prompt makes the current
+ * configuration apply to the next turn. Undefined leaves OpenCode's default.
+ */
+export function resolveOpenCodePromptModel(
+  inference: Record<string, unknown>,
+): { providerID: string; modelID: string } | undefined {
+  const model = inference.model;
+  if (typeof model !== 'string') return undefined;
+  const slash = model.indexOf('/');
+  if (slash <= 0 || slash === model.length - 1) return undefined;
+  return { providerID: model.slice(0, slash), modelID: model.slice(slash + 1) };
+}
+
 // OpenCode's interactive question tool cannot wait for an answer in a headless runner.
 export function resolveOpenCodeExecutionPolicy(): Record<string, unknown> {
   return {
