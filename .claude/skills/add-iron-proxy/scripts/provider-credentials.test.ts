@@ -20,7 +20,11 @@ function fixture() {
   const grants = new Set<string>();
   const request = vi.fn(async (resource: string, method = 'GET', data?: any) => {
     const [kind, action, namespace, id] = resource.split('/');
-    const key = kind + '/' + (method === 'GET' ? id : action);
+    // Iron's PUT/PATCH takes an opaque id (updates, 404 when gone) or a
+    // foreign id (upserts). The fixture keys records by foreign id.
+    const byOid = action.startsWith('id-') ? [...records.entries()].find(([, r]) => r.id === action) : undefined;
+    if (method !== 'GET' && action.startsWith('id-') && !byOid) throw new IronControlRequestError('fixture', 404);
+    const key = method === 'GET' ? kind + '/' + id : (byOid?.[0] ?? kind + '/' + action);
     if (method === 'GET') {
       const record = records.get(key);
       if (!record || record.namespace !== namespace) throw new IronControlRequestError('fixture', 404);
@@ -28,10 +32,12 @@ function fixture() {
       if (kind === 'broker_credentials') {
         response.status = record.dead ? 'dead' : 'live';
         response.last_refresh = 'refreshed-' + Date.now();
+        response.expires_at ??= new Date(Date.now() + 3_600_000).toISOString();
       }
       return response;
     }
-    const record = { ...data, id: records.get(key)?.id ?? 'id-' + records.size, foreign_id: action };
+    const foreignId = byOid ? byOid[1].foreign_id : action;
+    const record = { ...data, id: records.get(key)?.id ?? 'id-' + records.size, foreign_id: foreignId };
     if (kind === 'static_secrets') {
       if (data.source.secret !== undefined) values.set(record.id, data.source.secret);
       record.source = { source_type: data.source.source_type, config: data.source.config };
@@ -177,6 +183,72 @@ it('marks a dead broker for reauthentication instead of reporting a usable conne
   const next = f.connect(oauth);
   expect(await next.find()).toEqual({ reusable: false });
   await expect(next.keep()).rejects.toThrow('sign in again');
+});
+it('updates an existing credential by its opaque id so a replacement created in the race window is never overwritten', async () => {
+  const f = fixture();
+  const c = f.connect(api());
+  await c.find();
+  await c.save('fixture');
+  const id = idOf(f, api().name);
+  const next = f.connect(api());
+  await next.find();
+  const request = f.request.getMockImplementation()!;
+  let swapped = false;
+  f.request.mockImplementation(async (resource, method = 'GET', data) => {
+    // Between the last unchanged() read and the PUT, an operator deletes the
+    // record and recreates it under the same foreign id with other grants.
+    if (!swapped && method === 'PUT' && resource.startsWith('static_secrets/')) {
+      swapped = true;
+      const [key, old] = [...f.records.entries()].find(([, r]) => r.id === id)!;
+      f.records.set(key, { ...old, id: 'id-replacement' });
+      f.values.set('id-replacement', 'replacement-secret');
+      f.values.delete(id);
+    }
+    return request(resource, method, data);
+  });
+  await expect(next.save('rotated')).rejects.toMatchObject({ status: 404 });
+  expect(f.values.get('id-replacement')).toBe('replacement-secret');
+  expect([...f.values.values()]).not.toContain('rotated');
+  expect(f.grants.has('id-replacement')).toBe(false);
+});
+it('does not report a half-rotated OAuth login as reusable', async () => {
+  const f = fixture();
+  const first = f.connect(oauth);
+  await first.find();
+  await first.save({ ...tokens('refresh-A'), accountId: 'account-A' });
+  const relogin = f.connect(oauth);
+  await relogin.find();
+  const request = f.request.getMockImplementation()!;
+  let failed = false;
+  f.request.mockImplementation(async (resource, method = 'GET', data) => {
+    // Account B's refresh token lands in the broker, then the account-header write fails.
+    if (!failed && method === 'PUT' && resource.startsWith('static_secrets/') && data?.name?.endsWith(' account')) {
+      failed = true;
+      throw new Error('account write interrupted');
+    }
+    return request(resource, method, data);
+  });
+  await expect(relogin.save({ ...tokens('refresh-B'), accountId: 'account-B' })).rejects.toThrow('interrupted');
+  expect([...f.values.values()]).toContain('refresh-B');
+  expect([...f.values.values()]).toContain('account-A');
+  const retry = f.connect(oauth);
+  expect(await retry.find()).toEqual({ reusable: false });
+  await expect(retry.keep()).rejects.toThrow('sign in again');
+  await retry.save({ ...tokens('refresh-B'), accountId: 'account-B' });
+  expect([...f.values.values()]).toContain('account-B');
+  expect(await f.connect(oauth).find()).toEqual({ reusable: true });
+});
+it('treats a live broker whose token has expired as needing a new sign-in', async () => {
+  const f = fixture();
+  const c = f.connect(oauth);
+  await c.find();
+  await c.save(tokens());
+  const broker = [...f.records.values()].find((r) => r.client_id);
+  broker.expires_at = new Date(Date.now() - 1_000).toISOString();
+  const next = f.connect(oauth);
+  expect(await next.find()).toEqual({ reusable: false });
+  await expect(next.keep()).rejects.toThrow('sign in again');
+  expect(f.grants.size).toBe(2);
 });
 it('does not turn API unavailability into an absent credential', async () => {
   const f = fixture();

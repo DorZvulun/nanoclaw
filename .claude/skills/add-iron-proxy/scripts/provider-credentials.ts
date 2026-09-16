@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import type {
@@ -35,6 +35,15 @@ export function ironModelEndpoint(raw: string, root: string) {
 
 /** The header the ChatGPT profile routes on; a property of the profile, not of the caller. */
 const CHATGPT_ACCOUNT_HEADER = 'ChatGPT-Account-Id';
+/**
+ * One login writes three Iron records (broker, account secret, bearer secret).
+ * They share this label so an interrupted re-login cannot leave one account's
+ * bearer token paired with another account's header and still look reusable.
+ */
+const LOGIN_LABEL = 'nanoclaw.login';
+/** Iron's `live` only means a token was minted once; an expired one cannot authenticate. */
+const brokerExpired = (broker: any, now = Date.now()): boolean =>
+  broker?.status === 'live' && (typeof broker.expires_at !== 'string' || !(Date.parse(broker.expires_at) > now));
 const BEARER = { headerName: 'Authorization', valueFormat: 'Bearer {value}' };
 
 interface Dependencies {
@@ -172,6 +181,20 @@ export function createIronCredentialConnection(
       throw new Error('The Iron OAuth connection changed during setup; retry before saving');
     return { state, broker, account };
   };
+  // Reusable only when every record of the login carries the same marker and
+  // the broker can still mint a usable token. A mismatch or an expired token
+  // means signing in again, which rewrites all three records together.
+  const oauthReusable = (record: any, broker: any, account: any): boolean => {
+    const login = broker?.labels?.[LOGIN_LABEL];
+    return (
+      typeof login === 'string' &&
+      login.length > 0 &&
+      account?.labels?.[LOGIN_LABEL] === login &&
+      record?.labels?.[LOGIN_LABEL] === login &&
+      !broker.dead &&
+      !brokerExpired(broker)
+    );
+  };
   const read = async () => {
     if (!fs.existsSync(controlPaths(root).registration))
       throw new Error('Install Iron Control before connecting credentials');
@@ -187,7 +210,7 @@ export function createIronCredentialConnection(
       const { broker, account } = await oauthState();
       if (current && (!broker || !account || current.source.config?.credential_id !== broker.id))
         throw new Error('The Iron OAuth connection is incomplete; inspect it in Iron Control');
-      if (broker?.dead) canKeep = false;
+      if (current && !oauthReusable(current, broker, account)) canKeep = false;
     }
     return current;
   };
@@ -212,6 +235,7 @@ export function createIronCredentialConnection(
       if (
         refreshed.status === 'live' &&
         refreshed.last_refresh &&
+        !brokerExpired(refreshed) &&
         (afterRefresh === undefined || refreshed.last_refresh !== afterRefresh)
       )
         return;
@@ -253,7 +277,7 @@ export function createIronCredentialConnection(
         if (record && (!broker || !account || record.source.config?.credential_id !== broker.id))
           throw new Error('The Iron OAuth connection is incomplete; inspect it in Iron Control');
         oauthObserved = state;
-        canKeep = !broker?.dead;
+        canKeep = !record || oauthReusable(record, broker, account);
       }
       if (observed !== undefined && !isDeepStrictEqual(record, observed))
         throw new Error('The Iron credential changed during setup; retry before saving');
@@ -300,6 +324,11 @@ export function createIronCredentialConnection(
       await connectionDeps.allowHost(target.host);
       await connectionDeps.checkIsolation();
       await unchanged(existingId);
+      // An existing record is updated by its opaque id, which Iron refuses with
+      // 404 once the record is gone. The foreign-id form would upsert into a
+      // replacement created after the last unchanged() read, writing this value
+      // into a record whose grants were never checked.
+      const login = typeof value === 'string' ? undefined : randomUUID();
       const put = (id: string, source: unknown, config: unknown, name = target.name) =>
         connectionDeps.request(`static_secrets/${id}`, 'PUT', {
           namespace,
@@ -308,18 +337,24 @@ export function createIronCredentialConnection(
           inject_config: {},
           replace_config: config,
           rules: [{ host: target.host, http_methods: ['*'] }],
+          ...(login ? { labels: { [LOGIN_LABEL]: login } } : {}),
         });
       let source: unknown;
       let account: any;
       if (typeof value === 'string') source = { source_type: 'control_plane', secret: value, config: {} };
       else {
-        const broker = await connectionDeps.request(`broker_credentials/${foreignId}`, 'PUT', {
-          namespace,
-          name: target.name,
-          token_endpoint: oauth!.tokenEndpoint,
-          client_id: oauth!.clientId,
-          refresh_token: value.refreshToken,
-        });
+        const broker = await connectionDeps.request(
+          `broker_credentials/${oauthObserved?.broker?.id ?? foreignId}`,
+          'PUT',
+          {
+            namespace,
+            name: target.name,
+            token_endpoint: oauth!.tokenEndpoint,
+            client_id: oauth!.clientId,
+            refresh_token: value.refreshToken,
+            labels: { [LOGIN_LABEL]: login },
+          },
+        );
         if (!identity(broker, foreignId) || (oauthObserved?.broker && broker.id !== oauthObserved.broker.id))
           throw new Error('Iron did not confirm the OAuth broker identity');
         oauthObserved = {
@@ -338,13 +373,15 @@ export function createIronCredentialConnection(
         await unchanged(existingId);
         source = { source_type: 'token_broker', config: { credential_id: broker.id } };
         account = await put(
-          foreignId + '-account',
+          oauthObserved.account?.id ?? foreignId + '-account',
           { source_type: 'control_plane', secret: value.accountId, config: {} },
           replaceConfig(CHATGPT_ACCOUNT_HEADER),
           target.name + ' account',
         );
+        if (!identity(account, foreignId + '-account'))
+          throw new Error('Iron did not confirm the OAuth account identity');
       }
-      const saved = await put(foreignId, source, replaceConfig());
+      const saved = await put(existingId ?? foreignId, source, replaceConfig());
       if (!identity(saved, foreignId) || (existingId && saved.id !== existingId))
         throw new Error('Iron did not confirm the existing credential identity');
       await connectionDeps.grant(saved.id);
