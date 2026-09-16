@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   createOneCliCredentialConnection,
+  createProviderCredentialConnection,
   findOneCliCredential,
   type OneCliCredential,
 } from './provider-credentials.js';
@@ -330,5 +331,102 @@ describe('OpenCode credential host migration', () => {
       }),
     ).rejects.toThrow('unexpected metadata');
     expect(confirmHostChange).not.toHaveBeenCalled();
+  });
+});
+
+describe('gateway seam adapter', () => {
+  const key = (host = 'generativelanguage.googleapis.com') =>
+    ({
+      name: google.name,
+      kind: 'api-key',
+      host,
+      proxyValue: 'nc-fixture-token',
+      injection: google.injectionConfig!,
+    }) as const;
+  const chatgpt = {
+    name: CHATGPT_SECRET.name,
+    kind: 'oauth',
+    host: 'chatgpt.com',
+    proxyValue: 'nc-fixture-token',
+    oauth: { profile: 'chatgpt', clientId: 'public', tokenEndpoint: 'https://auth.example.test/oauth/token' },
+  } as const;
+  const gateway = (rows: () => unknown[], onWrite?: (init: RequestInit, url: string) => void) => {
+    vi.stubEnv('ONECLI_URL', 'https://vault.example');
+    vi.stubEnv('ONECLI_API_KEY', 'management-fixture');
+    const transport = vi.fn(async (url: string, init: RequestInit) => {
+      if (init.method !== 'GET') onWrite?.(init, url);
+      return new Response(JSON.stringify(init.method === 'GET' ? rows() : { id: 'created-id' }));
+    });
+    vi.stubGlobal('fetch', transport);
+    return transport;
+  };
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('keeps native ids inside the adapter and reports an inline entry as reusable', async () => {
+    const writes: Array<[string, unknown]> = [];
+    gateway(
+      () => [metadata()],
+      (init, url) => writes.push([url, JSON.parse(init.body as string)]),
+    );
+    const connection = createProviderCredentialConnection(key());
+    expect(await connection.find()).toEqual({ reusable: true });
+    await connection.keep();
+    await connection.save('rotated-fixture');
+    expect(writes).toEqual([
+      [
+        'https://vault.example/v1/secrets/existing-key',
+        { value: 'rotated-fixture', injectionConfig: google.injectionConfig },
+      ],
+    ]);
+  });
+
+  it('creates an entry when none exists and refuses keep() without one', async () => {
+    const writes: unknown[] = [];
+    gateway(
+      () => [],
+      (init) => writes.push(JSON.parse(init.body as string)),
+    );
+    const connection = createProviderCredentialConnection(key());
+    expect(await connection.find()).toBeNull();
+    await expect(connection.keep()).rejects.toThrow('No stored OpenCode credential');
+    await connection.save('google-fixture');
+    expect(writes).toEqual([expect.objectContaining({ name: google.name, type: 'generic', value: 'google-fixture' })]);
+  });
+
+  it('requires a lookup before a write so a concurrent change is always detected', async () => {
+    gateway(() => [metadata()]);
+    await expect(createProviderCredentialConnection(key()).save('x')).rejects.toThrow('Look up');
+    await expect(createProviderCredentialConnection(key()).keep()).rejects.toThrow('Look up');
+  });
+
+  it('translates the ChatGPT profile into the native openai record and nothing else', async () => {
+    const writes: unknown[] = [];
+    gateway(
+      () => [],
+      (init) => writes.push(JSON.parse(init.body as string)),
+    );
+    const connection = createProviderCredentialConnection(chatgpt);
+    await connection.find();
+    await connection.save({ profile: 'chatgpt', accessToken: 'a', refreshToken: 'r', accountId: 'acct' });
+    const stored = JSON.parse((writes[0] as { value: string }).value);
+    expect(writes[0]).toMatchObject({ type: 'openai', hostPattern: 'chatgpt.com' });
+    expect(stored).toMatchObject({
+      tokens: { access_token: 'a', refresh_token: 'r', account_id: 'acct' },
+      OPENAI_API_KEY: null,
+    });
+    await expect(connection.save('not-an-oauth-value')).rejects.toThrow('chatgpt OAuth profile');
+    await expect(createProviderCredentialConnection(key()).save({} as never)).rejects.toThrow('Look up');
+    expect(() =>
+      createProviderCredentialConnection({ ...chatgpt, oauth: { ...chatgpt.oauth, profile: 'other' as never } }),
+    ).toThrow('only the ChatGPT subscription OAuth profile');
+  });
+
+  it('rejects a string value for an api-key connection given an object and vice versa', async () => {
+    gateway(() => []);
+    const connection = createProviderCredentialConnection(key());
+    await connection.find();
+    await expect(
+      connection.save({ profile: 'chatgpt', accessToken: 'a', refreshToken: 'r', accountId: 'x' }),
+    ).rejects.toThrow('stores a string value');
   });
 });

@@ -1,4 +1,9 @@
 import { readEnvFile } from '../../../../src/env.js';
+import type {
+  GatewayCredentialConnection,
+  GatewayCredentialTarget,
+  GatewayOAuthCredential,
+} from '../../../../setup/gateways/credential-store.js';
 
 export interface KeyInjection {
   headerName: string;
@@ -206,43 +211,77 @@ export function createOneCliCredentialConnection(
   };
 }
 
-/** Native OneCLI translation is confined to its gateway adapter. */
+/**
+ * Native OneCLI translation is confined to this adapter. The seam hands over a
+ * destination, a header scheme, and parsed values; the vault id, the PATCH-vs-
+ * POST choice, and the stored JSON shape never leave this file.
+ */
 export function createProviderCredentialConnection(
-  target: import('../../../../setup/gateways/credential-store.js').GatewayCredentialTarget,
+  target: GatewayCredentialTarget,
   root = process.cwd(),
-): import('../../../../setup/gateways/credential-store.js').GatewayCredentialConnection {
+): GatewayCredentialConnection {
+  if (target.kind === 'oauth' && target.oauth.profile !== 'chatgpt') {
+    throw new Error(
+      `OneCLI stores only the ChatGPT subscription OAuth profile; ${String(target.oauth.profile)} is not supported.`,
+    );
+  }
   const vault = createOneCliCredentialConnection(
     {
       name: target.name,
+      // OneCLI's `openai` type is its native ChatGPT-subscription record: it
+      // refreshes the token and injects the account header itself.
       type: target.kind === 'oauth' ? 'openai' : 'generic',
       hostPattern: target.host,
-      ...(target.injection ? { injectionConfig: target.injection } : {}),
-      ...(target.kind === 'oauth' ? { authMode: 'oauth' as const } : {}),
+      ...(target.kind === 'api-key' ? { injectionConfig: target.injection } : { authMode: 'oauth' as const }),
     },
     undefined,
     undefined,
     globalThis.fetch,
     root,
   );
+  // OneCLI injects by host pattern; the runtime's placeholder is never matched.
+  void target.proxyValue;
+  let observed: string | null | undefined;
+  const require = (): string | null => {
+    if (observed === undefined) throw new Error('Look up the OpenCode credential before keeping or saving it.');
+    return observed;
+  };
   return {
-    find: vault.find,
-    keep: vault.keep,
-    save: (value, existingId) => {
-      if ((target.kind === 'api-key') !== (typeof value === 'string'))
-        throw new Error('Credential does not match its connection type');
-      const encoded =
-        typeof value === 'string'
-          ? value
-          : JSON.stringify({
-              tokens: {
-                access_token: value.accessToken,
-                refresh_token: value.refreshToken,
-                account_id: value.accountId,
-              },
-              OPENAI_API_KEY: null,
-              last_refresh: new Date().toISOString(),
-            });
-      return vault.save(encoded, existingId);
+    async find(options) {
+      observed = await vault.find(options);
+      // An inline OneCLI entry can always be kept: a host move is a metadata PATCH.
+      return observed === null ? null : { reusable: true };
+    },
+    async keep() {
+      const id = require();
+      if (id === null) throw new Error('No stored OpenCode credential to keep; enter a value.');
+      await vault.keep(id);
+    },
+    async save(value) {
+      const id = require();
+      observed = await vault.save(encodeOneCliValue(target, value), id);
     },
   };
+}
+
+/** OneCLI's `openai` record is the Codex login-file shape; OpenCode's parsed login is re-encoded into it. */
+export function encodeOneCliValue(target: GatewayCredentialTarget, value: string | GatewayOAuthCredential): string {
+  if (target.kind === 'api-key') {
+    if (typeof value !== 'string') throw new Error('An API-key connection stores a string value.');
+    return value;
+  }
+  if (typeof value === 'string' || value.profile !== target.oauth.profile) {
+    throw new Error(`This connection stores the ${target.oauth.profile} OAuth profile.`);
+  }
+  // NanoClaw's pinned OneCLI cannot refresh this record on its own; see
+  // .claude/skills/add-opencode/ONECLI-LEGACY.md for the manual procedure.
+  return JSON.stringify({
+    tokens: {
+      access_token: value.accessToken,
+      refresh_token: value.refreshToken,
+      account_id: value.accountId,
+    },
+    OPENAI_API_KEY: null,
+    last_refresh: new Date().toISOString(),
+  });
 }
