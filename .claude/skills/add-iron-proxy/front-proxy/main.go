@@ -507,6 +507,21 @@ func (w flushWriter) Write(p []byte) (int, error) {
 
 // Switch protocols only after both decisions. Socket bytes belong to this
 // authorized upgrade; they cannot be reinterpreted as unapproved HTTP requests.
+// The whole 101 handshake goes to the client in one write. Written line by
+// line, each header becomes its own TLS record, and WebSocket clients that
+// bound the handshake read count (tungstenite, used by the Codex CLI, allows
+// ten packets) abort with "Attack attempt detected" before the first frame.
+func writeUpgradeResponse(w io.Writer, header http.Header) error {
+	var buf bytes.Buffer
+	buf.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
+	if err := header.Write(&buf); err != nil {
+		return err
+	}
+	buf.WriteString("\r\n")
+	_, err := w.Write(buf.Bytes())
+	return err
+}
+
 func relayUpgrade(client net.Conn, resp *http.Response) {
 	upstream, ok := resp.Body.(io.ReadWriteCloser)
 	if !ok {
@@ -514,13 +529,7 @@ func relayUpgrade(client net.Conn, resp *http.Response) {
 		return
 	}
 	defer upstream.Close()
-	if _, err := io.WriteString(client, "HTTP/1.1 101 Switching Protocols\r\n"); err != nil {
-		return
-	}
-	if err := resp.Header.Write(client); err != nil {
-		return
-	}
-	if _, err := io.WriteString(client, "\r\n"); err != nil {
+	if err := writeUpgradeResponse(client, resp.Header); err != nil {
 		return
 	}
 	done := make(chan struct{}, 2)

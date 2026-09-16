@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -372,6 +373,42 @@ func TestRevocationCheckedForEveryRequestInSameTunnel(t *testing.T) {
 	}
 	if hits.Load() != 1 {
 		t.Fatalf("revoked session reached backend: %d", hits.Load())
+	}
+}
+
+// A tungstenite client (the Codex CLI) accepts at most ten reads for the
+// handshake; per-header writes produced twenty TLS records through the tunnel.
+type countingWriter struct {
+	writes int
+	bytes.Buffer
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	c.writes++
+	return c.Buffer.Write(p)
+}
+
+func TestUpgradeHandshakeIsOneWrite(t *testing.T) {
+	h := http.Header{}
+	for i := 0; i < 20; i++ {
+		h.Set(fmt.Sprintf("X-Header-%d", i), "value")
+	}
+	h.Set("Upgrade", "websocket")
+	h.Set("Connection", "Upgrade")
+	h.Set("Sec-WebSocket-Accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+	w := &countingWriter{}
+	if err := writeUpgradeResponse(w, h); err != nil {
+		t.Fatal(err)
+	}
+	if w.writes != 1 {
+		t.Fatalf("handshake took %d writes, want 1", w.writes)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(w.Bytes())), &http.Request{Method: "GET"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 101 || resp.Header.Get("Sec-WebSocket-Accept") != "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" || resp.Header.Get("X-Header-19") != "value" {
+		t.Fatalf("handshake not preserved: %d %v", resp.StatusCode, resp.Header)
 	}
 }
 
