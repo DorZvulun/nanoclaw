@@ -3,7 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"fmt"
+	"compress/gzip"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -15,6 +15,7 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	pb "github.com/ironsh/iron-proxy/gen/transform/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
@@ -337,6 +338,82 @@ func tlsBackend(t *testing.T, g **gateway, hits *atomic.Int32, capture ...func([
 		}
 	})
 }
+
+// A backend that compresses only when asked, like a real origin. The front must
+// pass its framing through unchanged, never negotiate gzip for the client.
+func encodingBackend(t *testing.T, g **gateway, sawEncoding *atomic.Bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, buf, e := w.(http.Hijacker).Hijack()
+		if e != nil {
+			return
+		}
+		defer raw.Close()
+		buf.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
+		buf.Flush()
+		host, _, _ := net.SplitHostPort(r.Host)
+		cert, e := (*g).certificate(host)
+		if e != nil {
+			t.Error(e)
+			return
+		}
+		conn := tls.Server(raw, &tls.Config{Certificates: []tls.Certificate{cert}})
+		if e = conn.Handshake(); e != nil {
+			return
+		}
+		inner, e := http.ReadRequest(bufio.NewReader(conn))
+		if e != nil {
+			return
+		}
+		body := []byte(`{"jsonrpc":"2.0","result":"plain body that must arrive whole"}`)
+		if strings.Contains(inner.Header.Get("Accept-Encoding"), "gzip") {
+			sawEncoding.Store(true)
+			var z bytes.Buffer
+			zw := gzip.NewWriter(&z)
+			zw.Write(body)
+			zw.Close()
+			fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: %d\r\n\r\n", z.Len())
+			conn.Write(z.Bytes())
+		} else {
+			fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n", len(body))
+			conn.Write(body)
+		}
+		// Keep the connection open: a body the client cannot delimit must not be rescued by EOF.
+		time.Sleep(500 * time.Millisecond)
+	})
+}
+
+func TestTunnelResponseKeepsUpstreamFramingForClientsWithoutAcceptEncoding(t *testing.T) {
+	b := &fixtureBridge{request: func(context.Context, *pb.TransformRequestRequest) (*pb.TransformRequestResponse, error) {
+		return &pb.TransformRequestResponse{Action: pb.TransformAction_TRANSFORM_ACTION_CONTINUE}, nil
+	}}
+	var g *gateway
+	var sawEncoding atomic.Bool
+	g, _ = fixture(t, b, encodingBackend(t, &g, &sawEncoding))
+	conn, reader, e := tunnel(t, g, "api.example.test")
+	if e != nil {
+		t.Fatal(e)
+	}
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	io.WriteString(conn, "POST /mcp HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 0\r\n\r\n")
+	response, e := http.ReadResponse(reader, &http.Request{Method: "POST"})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if sawEncoding.Load() {
+		t.Fatal("front negotiated gzip on the client's behalf")
+	}
+	if response.ContentLength < 0 && len(response.TransferEncoding) == 0 {
+		t.Fatalf("response has no framing: length=%d te=%v", response.ContentLength, response.TransferEncoding)
+	}
+	got, e := io.ReadAll(response.Body)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if string(got) != `{"jsonrpc":"2.0","result":"plain body that must arrive whole"}` {
+		t.Fatalf("body %q", got)
+	}
+}
+
 func TestRevocationCheckedForEveryRequestInSameTunnel(t *testing.T) {
 	var live atomic.Bool
 	live.Store(true)

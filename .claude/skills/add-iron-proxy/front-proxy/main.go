@@ -103,7 +103,7 @@ func newGateway(cfg config, bridge pb.TransformServiceClient) (*gateway, error) 
 	if cfg.TimeoutMS <= 0 || cfg.TimeoutMS > 300000 {
 		return nil, errors.New("invalid approval timeout")
 	}
-	return &gateway{cfg: cfg, ca: ca, signer: signer, key: key, bridge: bridge, transport: &http.Transport{Proxy: http.ProxyURL(backend), TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}, ForceAttemptHTTP2: false, ResponseHeaderTimeout: 5 * time.Minute, MaxIdleConns: 100, IdleConnTimeout: 90 * time.Second}}, nil
+	return &gateway{cfg: cfg, ca: ca, signer: signer, key: key, bridge: bridge, transport: &http.Transport{Proxy: http.ProxyURL(backend), TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}, ForceAttemptHTTP2: false, DisableCompression: true, ResponseHeaderTimeout: 5 * time.Minute, MaxIdleConns: 100, IdleConnTimeout: 90 * time.Second}}, nil
 }
 
 func (g *gateway) identity(r *http.Request) (string, error) {
@@ -269,6 +269,11 @@ func deny(r *http.Request, status int) *http.Response {
 	return &http.Response{StatusCode: status, Status: fmt.Sprintf("%d %s", status, http.StatusText(status)), Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1, Header: http.Header{"Content-Type": []string{"text/plain"}}, Body: io.NopCloser(strings.NewReader(http.StatusText(status) + "\n")), ContentLength: -1, Request: r, Close: true}
 }
 
+// The transport negotiates no encoding of its own (DisableCompression): a
+// client that sends no Accept-Encoding gets the upstream's identity framing.
+// Go's transparent gzip left a decompressed response with neither a length
+// nor a transfer encoding, which the tunnel then wrote as a body that never
+// ended; clients without a decompressor (reqwest in the Codex CLI) hung there.
 func (g *gateway) forward(r *http.Request, identity, tunnel string) *http.Response {
 	if r.Method == "CONNECT" || r.URL.User != nil || (r.URL.Scheme != "http" && r.URL.Scheme != "https") || (r.Header.Get("Upgrade") != "" && !strings.EqualFold(r.Header.Get("Upgrade"), "websocket")) {
 		return deny(r, 403)
